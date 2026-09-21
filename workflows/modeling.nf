@@ -1,8 +1,6 @@
-def modeling_output_subfolder = "modeling"
-def model_run_id = "model_run_" + new Date().format("dd_MMM_yyyy_HH_mm_ss")
-
-
 process WriteDesignMetadata {
+    publishDir "${params.outdir}/modeling/${params.model_run_id}/design_metadata", mode: 'copy'
+
     input:
     val design_formula
     val lrt_contrasts
@@ -10,8 +8,6 @@ process WriteDesignMetadata {
     output:
     path "design.json"
     path "lrt_contrasts.json", emit: lrt_contrasts_json
-
-    publishDir "${params.outdir}/${modeling_output_subfolder}/${model_run_id}/design_metadata", mode: 'copy'
 
     script:
     def design_obj = [
@@ -30,6 +26,8 @@ process WriteDesignMetadata {
 
 
 process CreateDesignMatrices {
+    publishDir "${params.outdir}/modeling/${params.model_run_id}/design_matrices", mode: 'copy'
+
     input:
     path samplesheet
     val design_formula
@@ -39,8 +37,6 @@ process CreateDesignMatrices {
     path("design_matrix.tsv"), emit: design_matrix
     path("lrt_metadata.tsv"), emit: lrt_metadata
     path("reduced_design_matrices"), emit: reduced_design_matrices
-
-    publishDir "${params.outdir}/${modeling_output_subfolder}/${model_run_id}/design_matrices", mode: 'copy'
 
     script:
     """
@@ -52,6 +48,8 @@ process CreateDesignMatrices {
 }
 
 process GetModeledGenes {
+    publishDir "${params.outdir}/modeling/${params.model_run_id}/modeled_genes", mode: 'copy'
+
     input:
     tuple(path(gene_names), path(modelable_genes), path(modelable_introns))
 
@@ -60,8 +58,6 @@ process GetModeledGenes {
     path("intron_chunks/modeled_introns_chunk_*.tsv"), emit: intron_chunks
     path("modeled_genes.tsv"), emit: modeled_genes
     path("modeled_introns.tsv"), emit: modeled_introns
-
-    publishDir "${params.outdir}/${modeling_output_subfolder}/${model_run_id}/modeled_genes", mode: 'copy'
 
     script:
     """
@@ -96,7 +92,7 @@ process FitModel {
     path("test_results*.tsv"), emit: test_results_chunk
     tuple path("cache_for_regularization*.pt"), val(chunk_name), emit: cache_for_regularization
 
-//     publishDir "${params.outdir}/${modeling_output_subfolder}/${model_run_id}/processing_chunks/model_results_chunks/${chunk_name}", mode: 'copy'
+//     publishDir "${params.outdir}/modeling/${params.model_run_id}/processing_chunks/model_results_chunks/${chunk_name}", mode: 'copy'
 
     script:
     """
@@ -192,6 +188,8 @@ process FitIntronCoverageModel {
 }
 
 process FitGlobalIntronCoverageModel {
+    publishDir "${params.outdir}/modeling/${params.model_run_id}/global_intron_coverage_model", mode: 'copy'
+
     input:
     tuple(
         path(modeled_introns),
@@ -205,8 +203,6 @@ process FitGlobalIntronCoverageModel {
     output:
     path("model_parameters.tsv"), emit: model_parameters
     path("test_results_raw.tsv"), emit: test_results
-
-    publishDir "${params.outdir}/${modeling_output_subfolder}/${model_run_id}/global_intron_coverage_model", mode: 'copy'
 
     script:
     """
@@ -223,6 +219,8 @@ process FitGlobalIntronCoverageModel {
 }
 
 process FitGlobalRnaKineticsModel {
+    publishDir "${params.outdir}/modeling/${params.model_run_id}/global_rna_kinetics_model", mode: 'copy'
+
     input:
     tuple(
         path(modeled_genes),
@@ -240,8 +238,6 @@ process FitGlobalRnaKineticsModel {
     output:
     path("model_parameters.tsv"), emit: model_parameters
     path("test_results_raw.tsv"), emit: test_results
-
-    publishDir "${params.outdir}/${modeling_output_subfolder}/${model_run_id}/global_rna_kinetics_model", mode: 'copy'
 
     script:
     """
@@ -262,6 +258,13 @@ process FitGlobalRnaKineticsModel {
 }
 
 process MergeModelResultChunks {
+    publishDir { "${params.outdir}/modeling/${params.model_run_id}/${model_type_subfolder}" },
+     mode: 'copy',
+     saveAs: { filename ->
+            if( filename == 'test_results_before_regularization.tsv' ) null // Not publishing intermediate test results
+            else filename
+        }
+
     input:
     path model_parameters_chunks
     path test_results_chunks
@@ -270,12 +273,6 @@ process MergeModelResultChunks {
     output:
     path("test_results_before_regularization.tsv"), emit: test_results_before_regularization
     path("model_parameters.tsv"), emit: model_parameters
-    publishDir "${params.outdir}/${modeling_output_subfolder}/${model_run_id}/${model_type_subfolder}",
-     mode: 'copy',
-     saveAs: { filename ->
-            if( filename == 'test_results_before_regularization.tsv' ) null // Not publishing intermediate test results
-            else filename
-        }
 
     script:
     """
@@ -288,14 +285,14 @@ process MergeModelResultChunks {
 
 
 process AdaptiveShrinkage {
+    publishDir { "${params.outdir}/modeling/${params.model_run_id}/${model_type_subfolder}" }, mode: 'copy'
+
     input:
     path model_parameters
     val model_type_subfolder
 
     output:
     path("regularization_coefficients.tsv"), emit: regularization_coefficients
-
-    publishDir "${params.outdir}/${modeling_output_subfolder}/${model_run_id}/${model_type_subfolder}", mode: 'copy'
 
     script:
     """
@@ -315,7 +312,7 @@ process FitRegularizedModel {
     output:
     path("regularized_model_parameters*.tsv"), emit: regularized_model_parameters_chunk
 
-//     publishDir "${params.outdir}/${modeling_output_subfolder}/${model_run_id}/processing_chunks/regularized_model_results_chunks/${chunk_name}", mode: 'copy'
+//     publishDir "${params.outdir}/modeling/${params.model_run_id}/processing_chunks/regularized_model_results_chunks/${chunk_name}", mode: 'copy'
 
     script:
     """
@@ -349,6 +346,8 @@ process FitRegularizedIntronCoverageModel {
 }
 
 process MergeRegularization {
+    publishDir { "${params.outdir}/modeling/${params.model_run_id}/${model_type_subfolder}" }, mode: 'copy'
+
     input:
     path test_results_before_regularization
     path regularized_model_parameters_chunks
@@ -357,8 +356,6 @@ process MergeRegularization {
     output:
     path("raw_test_results.tsv"), emit: raw_test_results
     path("regularized_model_parameters.tsv")
-
-    publishDir "${params.outdir}/${modeling_output_subfolder}/${model_run_id}/${model_type_subfolder}", mode: 'copy'
 
     script:
     """
@@ -370,6 +367,8 @@ process MergeRegularization {
 }
 
 process PostprocessResultsAndPlot {
+    publishDir { "${params.outdir}/modeling/${params.model_run_id}/${model_type_subfolder}" }, mode: 'copy'
+
     input:
     path raw_test_results
     val model_type
@@ -378,8 +377,6 @@ process PostprocessResultsAndPlot {
     output:
     path("test_results/test_results.tsv"), emit: test_results
     path("test_results/volcano_plots/**")
-
-    publishDir "${params.outdir}/${modeling_output_subfolder}/${model_run_id}/${model_type_subfolder}", mode: 'copy'
 
     script:
     """
@@ -391,6 +388,8 @@ process PostprocessResultsAndPlot {
 }
 
 process PostprocessGlobalResultsAndPlot {
+    publishDir { "${params.outdir}/modeling/${params.model_run_id}/${model_type_subfolder}" }, mode: 'copy'
+
     input:
     path test_results
     val model_type
@@ -399,8 +398,6 @@ process PostprocessGlobalResultsAndPlot {
     output:
     path("test_results/test_results.tsv"), emit: test_results
     path("test_results/plots/**")
-
-    publishDir "${params.outdir}/${modeling_output_subfolder}/${model_run_id}/${model_type_subfolder}", mode: 'copy'
 
     script:
     """
@@ -686,14 +683,14 @@ workflow global_rna_kinetics_model_subworkflow {
 
 
 process StratifiedIntronMetacoveragePlots {
+    publishDir "${params.outdir}/modeling/${params.model_run_id}/stratified_intron_metacoverage_plots", mode: 'copy'
+
     input:
     tuple path(coverage_parquet_files), path(introns_bed_file), path(gene_names_csv), path(samplesheet)
     val design_formula
 
     output:
     path("*/*")
-
-    publishDir "${params.outdir}/${modeling_output_subfolder}/${model_run_id}/stratified_intron_metacoverage_plots", mode: 'copy'
 
     script:
     """

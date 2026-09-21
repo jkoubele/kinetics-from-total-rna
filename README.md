@@ -226,11 +226,28 @@ and filling it according to the comments. We will now discuss several parameter 
 
 ### Executing the pipeline
 
-Please install [Nextflow](https://www.nextflow.io/) (version >= 25.04) and [Docker](https://www.docker.com/) on your system.
-Then, the pipeline can be run by
+Please install [Nextflow](https://www.nextflow.io/) and one of the container engines
+[Docker](https://www.docker.com/), [Singularity](https://sylabs.io/singularity/) or
+[Apptainer](https://apptainer.org/) on your system. Then, the pipeline can be run by
 
 ```commandline
-nextflow run main.nf -params-file dataset_params.yaml
+nextflow run main.nf -params-file dataset_params.yaml -profile docker
+```
+
+If you are using Singularity or Apptainer, please use ```-profile singularity``` or ```-profile apptainer``` instead.
+Our Docker images are used in all cases; Singularity and Apptainer convert them automatically. The images are
+fairly large, so we recommend setting ```NXF_SINGULARITY_CACHEDIR``` (or
+```NXF_APPTAINER_CACHEDIR```) to a shared folder, so that the conversion is done only once and not for every dataset.
+
+Please note that one of these profiles is always required: without it, Nextflow would try to run the tools directly
+on your system, without any container.
+
+We have developed and tested the pipeline with Nextflow 26.04.6. Since newer Nextflow versions occasionally
+introduce breaking changes, you can run the pipeline with exactly this version (regardless of the version you have
+installed) by setting the ```NXF_VER``` variable; Nextflow will download it automatically:
+
+```commandline
+NXF_VER=26.04.6 nextflow run main.nf -params-file dataset_params.yaml -profile docker
 ```
 
 Please note that the pipeline is computationally demanding. The read alignment is the most costly
@@ -250,7 +267,7 @@ For testing purposes, we also provide the *local* profile, which caps the memory
 so that the pipeline can be run on a machine with 64 GB of RAM:
 
 ```commandline
-nextflow run main.nf -params-file dataset_params.yaml -profile local
+nextflow run main.nf -params-file dataset_params.yaml -profile local,docker
 ```
 
 We have tested this profile on a small dataset (C. elegans), but we cannot guarantee that it will be
