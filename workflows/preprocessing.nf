@@ -1,21 +1,18 @@
-def preprocessing_output_subfolder = "preprocessing"
-
 // bp trimmed from each intron edge. Shared between the intronic-read overlap
 // threshold (ExtractIntronicReads) and the coverage rescaling window
 // (RescaleCoverage) so the two stay coupled.
-def edge_margin = 10
+def edge_margin() { 10 }
 
 process FastQC {
+    tag "$sample"
+    publishDir "${params.outdir}/preprocessing/FastQC", mode: 'copy'
+
     input:
     tuple val(sample), path(read1), path(read2), val(is_paired)
-
-    tag "$sample"
 
     output:
     path("*.zip"), emit: fastqc_reports
     path("*.html")
-
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/FastQC", mode: 'copy'
 
     script:
     def reads = is_paired ? "$read1 $read2" : "$read1"
@@ -25,14 +22,14 @@ process FastQC {
 }
 
 process MultiQC {
+    publishDir "${params.outdir}/preprocessing/MultiQC", mode: 'copy'
+
     input:
     path zip_files
 
     output:
     path("multiqc_report.html")
     path("multiqc_report_data")
-
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/MultiQC", mode: 'copy'
 
     script:
     """
@@ -41,6 +38,8 @@ process MultiQC {
 }
 
 process ExtractGenomicFeatures {
+    publishDir "${params.outdir}/preprocessing/genomic_features", mode: 'copy'
+
     input:
     path gtf
     val precomputed_genomic_features_dir
@@ -56,8 +55,6 @@ process ExtractGenomicFeatures {
         path('blacklisted_introns.gtf'), optional: true
         path("protein_coding_genes.csv"), emit: protein_coding_gene_names
         path("all_genes.csv"), emit: all_genes
-
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/genomic_features", mode: 'copy'
 
     script:
     if (precomputed_genomic_features_dir) {
@@ -81,14 +78,14 @@ process ExtractGenomicFeatures {
 
 
 process BuildStarIndex {
+    publishDir "${params.outdir}/preprocessing/STAR_index", mode: 'copy'
+
     input:
     path fasta
     path gtf
 
     output:
     path("star_index"), emit: star_index_dir
-
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/STAR_index", mode: 'copy'
 
     script:
     """
@@ -104,6 +101,8 @@ process BuildStarIndex {
 }
 
 process BuildSalmonIndex {
+    publishDir "${params.outdir}/preprocessing/Salmon_index", mode: 'copy'
+
     input:
     path transcriptome_fasta
     path genome_fasta
@@ -115,8 +114,6 @@ process BuildSalmonIndex {
     path("salmon_index"), emit: salmon_index_dir
     path("decoy_transcriptome/gentrome.fa", optional: true)
     path("decoy_transcriptome/decoys.txt", optional: true)
-
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/Salmon_index", mode: 'copy'
 
     script:
     def gencode_flag = gtf_source == 'gencode' ? '--gencode' : ''
@@ -150,13 +147,13 @@ process BuildSalmonIndex {
 }
 
 process PrepareTx2Gene {
+    publishDir "${params.outdir}/preprocessing/tx2gene", mode: 'copy'
+
     input:
     path gtf
 
     output:
     path("tx2gene.tsv"), emit: tx2gene_file
-
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/tx2gene", mode: 'copy'
 
     script:
     """
@@ -165,13 +162,13 @@ process PrepareTx2Gene {
 }
 
 process CreateGenomeFastaIndex {
+    publishDir "${params.outdir}/preprocessing/genome_fai", mode: 'copy'
+
     input:
     path genome_fasta
 
     output:
     path("*.fai"), emit: genome_fai_file
-
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/genome_fai", mode: 'copy'
 
     script:
     """
@@ -180,16 +177,15 @@ process CreateGenomeFastaIndex {
 }
 
 process STARAlign {
+    publishDir { "${params.outdir}/preprocessing/STAR/${sample}" }, mode: 'copy'
+    tag "$sample"
+
     input:
         tuple val(sample), path(read1), path(read2), path(star_index), val(is_paired)
 
     output:
         tuple val(sample), path("${sample}.Aligned.sortedByCoord.out.bam"), emit: star_bam
         path("${sample}.*")
-
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/STAR/${sample}", mode: 'copy'
-
-    tag "$sample"
 
     script:
     def reads_arg    = is_paired ? "--readFilesIn $read1 $read2" : "--readFilesIn $read1"
@@ -210,6 +206,9 @@ process STARAlign {
 }
 
 process ExtractIntronicReads {
+    publishDir { "${params.outdir}/preprocessing/intronic_reads/${sample}" }, mode: 'copy'
+    tag "$sample"
+
     input:
         tuple val(sample), path(bam_file), val(strand), val(is_paired), path(introns_bed_file)
 
@@ -218,10 +217,6 @@ process ExtractIntronicReads {
         tuple val(sample), path("intronic_reads_plus_strand.bed.gz"), path("intronic_reads_minus_strand.bed.gz"),  emit:  intronic_bed_files
         tuple val(sample), path("${sample}.intron_read_counts.tsv"), emit:  intron_read_counts
 
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/intronic_reads/${sample}", mode: 'copy'
-
-    tag "$sample"
-
     script:
     def paired_arg = is_paired ? "" : "--unpaired_sequencing"
     """
@@ -229,7 +224,7 @@ process ExtractIntronicReads {
         --input_bam $bam_file \\
         --intron_bed_file $introns_bed_file \\
         --strandedness $strand \\
-        --edge_margin ${edge_margin} \\
+        --edge_margin ${edge_margin()} \\
         $paired_arg
 
     mv intron_read_counts.tsv ${sample}.intron_read_counts.tsv
@@ -246,15 +241,14 @@ process ExtractIntronicReads {
 }
 
 process RemoveIntronicReadsFromFASTQ {
+    publishDir { "${params.outdir}/preprocessing/FASTQ_without_intronic_reads/${sample}" }, mode: 'copy'
+    tag "$sample"
+
     input:
         tuple val(sample), path(read1), path(read2), path(bam_introns), val(is_paired)
 
     output:
         tuple val(sample), path("R*.fastq.gz"), val(is_paired), emit: exonic_fastq
-
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/FASTQ_without_intronic_reads/${sample}", mode: 'copy'
-
-    tag "$sample"
 
     script:
     if (is_paired)
@@ -282,16 +276,15 @@ process RemoveIntronicReadsFromFASTQ {
 }
 
 process SalmonQuantification {
+    publishDir { "${params.outdir}/preprocessing/Salmon_quantification/${sample}" }, mode: 'copy'
+    tag "$sample"
+
     input:
         tuple val(sample), path(reads), val(is_paired), path(salmon_index)
 
     output:
         tuple val(sample), path("${sample}.quant.sf"), emit: salmon_quant
         path("**")
-
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/Salmon_quantification/${sample}", mode: 'copy'
-
-    tag "$sample"
 
     script:
     def reads_arg = is_paired ? "-1 ${reads[0]} -2 ${reads[1]}" : "-r ${reads[0]}"
@@ -307,15 +300,14 @@ process SalmonQuantification {
 }
 
 process ComputeCoverage {
+    publishDir { "${params.outdir}/preprocessing/bed_graph_intron_coverage/${sample}" }, mode: 'copy'
+    tag "$sample"
+
     input:
         tuple val(sample), path(bed_file_plus), path(bed_file_minus), path(genome_fai_file)
 
     output:
         tuple val(sample), path("coverage_plus.bedGraph.gz"), path("coverage_minus.bedGraph.gz"), emit: bed_graph_files
-
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/bed_graph_intron_coverage/${sample}", mode: 'copy'
-
-    tag "$sample"
 
     script:
     """
@@ -338,16 +330,14 @@ process ComputeCoverage {
 }
 
 process RescaleCoverage {
+    publishDir "${params.outdir}/preprocessing/rescaled_coverage", mode: 'copy'
+    tag "$sample"
+
     input:
         tuple val(sample), path(bedgraph_file_plus), path(bedgraph_file_minus), path(intron_counts_file), path(introns_bed_file)
 
-
     output:
     path("${sample}.parquet"), emit: coverage_parquet_file
-
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/rescaled_coverage", mode: 'copy'
-
-    tag "$sample"
 
     script:
     """
@@ -357,18 +347,18 @@ process RescaleCoverage {
         --introns_bed_file $introns_bed_file \
         --output_file_basename $sample \
         --introns_count_file $intron_counts_file \
-        --edge_margin ${edge_margin}
+        --edge_margin ${edge_margin()}
     """
 }
 
 process IntronMetacoveragePlots {
+    publishDir "${params.outdir}/preprocessing/intron_metacoverage_plots", mode: 'copy'
+
     input:
         tuple path(coverage_parquet_files), path(introns_bed_file), path(gene_names_csv)
 
     output:
     path("*.png")
-
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/intron_metacoverage_plots", mode: 'copy'
 
     script:
     """
@@ -381,6 +371,8 @@ process IntronMetacoveragePlots {
 }
 
 process AggregateReadCounts {
+    publishDir "${params.outdir}/preprocessing/aggregated_counts", mode: 'copy'
+
     input:
     tuple val(sample_names), path(exon_quant_files), path(intron_counts_files), path(tx2gene), val(ignore_tx_version), file(protein_coding_genes_csv)
 
@@ -390,8 +382,6 @@ process AggregateReadCounts {
         path("library_size_factors.tsv"), emit: library_size_factors
         path("isoform_length_factors.tsv"), emit: isoform_length_factors
         path("*.png")
-
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/aggregated_counts", mode: 'copy'
 
     script:
     """
@@ -406,6 +396,8 @@ process AggregateReadCounts {
 }
 
 process FindModelableGenes {
+    publishDir "${params.outdir}/preprocessing/modelable_genes", mode: 'copy'
+
     input:
         tuple path(exon_counts_tsv), path(intron_counts_tsv), path(all_genes_csv)
 
@@ -413,8 +405,6 @@ process FindModelableGenes {
     path("modelable_genes.tsv"), emit: modelable_genes
     path("modelable_introns.tsv"), emit: modelable_introns
     tuple path("non_modelable_genes.tsv"), path("non_modelable_introns.tsv")
-
-    publishDir "${params.outdir}/${preprocessing_output_subfolder}/modelable_genes", mode: 'copy'
 
     script:
     """
@@ -502,8 +492,8 @@ workflow preprocessing_workflow {
 
         def aligned_bams = samples
         .combine(star_index_channel)
-        .map { sample, r1, r2, strand, is_paired, star_index ->
-            tuple(sample, r1, r2, star_index, is_paired)
+        .map { sample, r1, r2, strand, is_paired, star_index_dir ->
+            tuple(sample, r1, r2, star_index_dir, is_paired)
         } | STARAlign
 
        def extracted_intronic_reads = aligned_bams.star_bam
