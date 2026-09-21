@@ -41,6 +41,11 @@ lrt_contrasts: # List of contrasts for likelihood ratio tests.
 
   - variable: "your_continuous_variable_to_test"
 
+run_name: null # Optional name of the output folder for the modeling results (in <outdir>/modeling/).
+# If left null, a name based on the current timestamp is used (e.g. model_run_21_Sep_2026_13_57_42), so every run gets its own folder.
+# Please note that reusing an existing run_name writes into the same folder: files with the same name are overwritten,
+# and files from the previous run that are not produced again are kept, so the folder may end up mixing results of both runs.
+
 stage: 'all' # One of ['preprocess', 'model', 'all'].
 
 
