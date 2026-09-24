@@ -11,6 +11,13 @@ parser$add_argument("--model_parameters",
                     help = "Path to TSV file with model parameters.")
 parser$add_argument("--output_folder", default = ".",
                     help = "Where to write the output TSV with regularization coefficients.")
+parser$add_argument("--max_abs_value", type = "double", default = 10,
+                    help = paste("Entries with |value| above this (natural log scale) are excluded from the ash fit.",
+                                 "They come from degenerate fits where the likelihood is flat and the optimizer ran off;",
+                                 "they are not effect-size observations, and including them both overflows ashr and",
+                                 "inflates the estimated prior by an order of magnitude."))
+parser$add_argument("--max_se", type = "double", default = 10,
+                    help = "Entries with SE above this carry no information about the prior and are excluded.")
 
 
 args <- parser$parse_args()
@@ -35,6 +42,19 @@ for (parameter in unique(model_parameters$parameter_type)) {
              !is.na(value),
              !is.na(SE),
              SE > 0)
+
+    num_before_bounds <- nrow(df_feature)
+    df_feature <- df_feature |>
+      filter(abs(value) <= args$max_abs_value,
+             SE <= args$max_se)
+    num_excluded <- num_before_bounds - nrow(df_feature)
+    if (num_excluded > 0) {
+      message(sprintf(
+        "Excluded %d of %d entries (%.1f%%) outside the bounds |value| <= %g and SE <= %g for parameter_type='%s', feature_name='%s'.",
+        num_excluded, num_before_bounds, 100 * num_excluded / num_before_bounds,
+        args$max_abs_value, args$max_se, parameter, feature
+      ))
+    }
 
     if (nrow(df_feature) == 0) {
       message(sprintf(
