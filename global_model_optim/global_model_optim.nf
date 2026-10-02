@@ -8,13 +8,13 @@ nextflow.enable.dsl = 2
 
 process FitGlobalModelExperiment {
     tag { "${experiment} | ${model_type} | ${dataset_name}" }
-    publishDir { "${params.outdir}/${experiment}/${model_type}/${dataset_name}" }, mode: 'copy'
+    publishDir { "${run_dir}/${experiment}/${model_type}/${dataset_name}" }, mode: 'copy'
     container params.container_python
     cpus params.fit_cpus
     memory params.fit_memory
 
     input:
-    tuple val(experiment), val(model_type), val(dataset_name), path(dataset_dir)
+    tuple val(run_dir), val(experiment), val(model_type), val(dataset_name), path(dataset_dir)
 
     output:
     path 'summary.tsv', emit: summary
@@ -45,12 +45,13 @@ process FitGlobalModelExperiment {
 }
 
 process CollectSummaries {
-    publishDir "${params.outdir}", mode: 'copy'
+    publishDir { "${run_dir}" }, mode: 'copy'
     container params.container_python
     cpus 1
     memory '4 GB'
 
     input:
+    val run_dir
     // Every run produces a file called summary.tsv, so they need unique names when staged.
     path summary_files, stageAs: 'summary_*.tsv'
 
@@ -74,6 +75,40 @@ workflow {
     def experiment_names = params.experiments.tokenize(',').collect { it.trim() }
     def model_type_names = params.model_types.tokenize(',').collect { it.trim() }
 
+    // Each invocation gets its own results_NNN folder, so runs at different settings sit side by
+    // side instead of overwriting each other. The settings themselves go into run_spec.json rather
+    // than into the folder name. Note that the CLI --overrides are applied after the config is
+    // parsed, which is why this is computed here and not in nextflow.config.
+    def used_indices = files("${params.output_root}/results_*", type: 'dir')
+            .collect { it.name }
+            .findAll { it ==~ /results_\d{3}/ }
+            .collect { it.substring(8) as int }
+    def run_name = params.run_name ?: String.format('results_%03d', (used_indices + [0]).max() + 1)
+    def run_dir = "${params.output_root}/${run_name}"
+
+    def run_spec = [
+        run_name     : run_name,
+        started_at   : new Date().format("yyyy-MM-dd HH:mm:ss"),
+        experiments  : experiment_names,
+        model_types  : model_type_names,
+        data_dir     : params.data_dir.toString(),
+        // Values arriving from the command line are strings, so cast them for the json.
+        num_genes    : params.num_genes ? params.num_genes as int : null,
+        num_introns  : params.num_introns ? params.num_introns as int : null,
+        num_lrt_tests: params.num_lrt_tests ? params.num_lrt_tests as int : null,
+        seed         : params.seed as int,
+        profile      : workflow.profile,
+        nextflow_run : workflow.runName,
+        // workflow.commitId is only set for pipelines pulled from a git repo, which is not how this
+        // one is launched, so ask git directly about the working tree.
+        git_revision : ['git', '-C', "${projectDir}", 'rev-parse', '--short', 'HEAD'].execute().text.trim() ?: 'unknown',
+        command_line : workflow.commandLine,
+    ]
+    file(run_dir).mkdirs()
+    file("${run_dir}/run_spec.json").text = groovy.json.JsonOutput.prettyPrint(
+        groovy.json.JsonOutput.toJson(run_spec))
+    log.info "Writing results to ${run_dir}"
+
     dataset_channel = Channel
         .fromList(model_type_names)
         .flatMap { model_type ->
@@ -87,9 +122,9 @@ workflow {
     run_channel = dataset_channel
         .combine(Channel.fromList(experiment_names))
         .map { model_type, dataset_name, dataset_dir, experiment ->
-            [experiment, model_type, dataset_name, dataset_dir]
+            [run_dir, experiment, model_type, dataset_name, dataset_dir]
         }
 
     FitGlobalModelExperiment(run_channel)
-    CollectSummaries(FitGlobalModelExperiment.out.summary.collect())
+    CollectSummaries(run_dir, FitGlobalModelExperiment.out.summary.collect())
 }

@@ -52,7 +52,13 @@ uses everything.
 
 ## Outputs
 
-Per run, in `results/<experiment>/<model_type>/<dataset>/`:
+Each invocation creates its own `results_NNN/` folder next to the pipeline, auto-numbered, so runs
+at different settings sit side by side instead of overwriting each other. `--run_name` overrides the
+numbering when a run deserves a name. The settings live in `results_NNN/run_spec.json` (experiments,
+model types, subsetting, seed, profile, git revision, full command line) rather than in the folder
+name.
+
+Per run, in `results_NNN/<experiment>/<model_type>/<dataset>/`:
 
 | file | schema |
 |---|---|
@@ -61,7 +67,7 @@ Per run, in `results/<experiment>/<model_type>/<dataset>/`:
 | `training_log.tsv` | per-epoch losses: `fit_label`, `stage`, `epoch`, `loss` |
 | `run_metadata.json` | experiment, dataset, sizes, seed, git revision, torch version and thread count, host, wall time |
 
-`results/all_summaries.tsv` concatenates every `summary.tsv`. It is a few hundred rows, so that is
+`results_NNN/all_summaries.tsv` concatenates every `summary.tsv`. It is a few hundred rows, so that is
 the file to copy off the cluster; the rest stays put until a specific run needs investigating.
 
 **Keep `summary.tsv` fixed-schema.** Anything experiment-specific belongs in `training_log.tsv`,
@@ -108,3 +114,10 @@ each returning `(model_param_df, test_results_df, training_log_df)`.
   stage is skipped. `rna_kinetics.estimation` behaves the same way.
 - Wall times under Nextflow on one machine are not comparable to a single local run: concurrent
   PyTorch processes contend for CPU. Compare timings within a run, not across setups.
+- The timeline and trace reports are not written, since their paths are fixed at config-parse time
+  and would be overwritten by every run. `wall_time_seconds` in `summary.tsv` covers the timing that
+  matters here.
+- For the development loop, cut datasets rather than scale. The cluster wall time is dominated by
+  the number of tasks, and a single dataset at 200 genes runs locally in about 7 seconds -- which is
+  enough to reproduce the negative-chi2 failure on
+  `minor_spliceosome_inhibition_GSE294209` / `rna_kinetics`.
