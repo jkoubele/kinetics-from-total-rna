@@ -77,6 +77,27 @@ working, which is the whole point of the harness.
 The acceptance criterion is `chi2_is_negative == False` everywhere: a negative chi2 means a reduced
 (more constrained) model reached a lower loss than the full one, which cannot happen at an optimum.
 
+## Experiments
+
+| module | strategy |
+|---|---|
+| `experiment_001` | the current two-stage LBFGS, unchanged, with the loss curves kept |
+| `experiment_002` | refit the full model warm-started from any reduced fit that beats it, repeating until none does |
+
+`experiment_002` reduces exactly to `experiment_001` when no restart is triggered, so it cannot
+regress. Its knobs are module constants: `MAX_FULL_MODEL_RESTARTS` (10) and `CHI2_TOLERANCE` (0.1,
+below which a negative chi2 is treated as numerical noise rather than a failed fit). It adds
+`num_full_model_restarts` to `summary.tsv` and a `stage = 'initial'`, `epoch = 0` row per fit to
+`training_log.tsv`, which is the loss at the starting point -- the number that shows whether a warm
+start landed where it should.
+
+⚠ The design matrices carry **no intercept column**: the models hold their own intercepts. So a
+reduced design is nested in `[1, X]`, not in `X`, and warm-starting the full model from a reduced
+fit has to project onto `[1, X]` and absorb the leftover constant into the intercepts. Projecting
+onto `X` alone is exact only for a two-level factor, where the reduced matrix is empty. On a
+three-level design the gap was +109 (beta) and +8254 (gamma) in a direct check, so this matters for
+any dataset with a multi-level factor -- CCR4-NOT above all.
+
 ## Adding an experiment
 
 Copy `experiments/experiment_001.py`, change only the training code, and import everything else

@@ -231,7 +231,7 @@ def main() -> None:
         'group_1', 'group_2', 'lrt_df', 'lfc', 'loss_full_model', 'loss_reduced_model',
         'chi2_test_statistics', 'chi2_is_negative', 'p_value',
         'training_diverged_reduced_model', 'training_converged_within_max_epochs_reduced_model',
-        'num_epochs_full_model', 'num_epochs_reduced_model',
+        'num_epochs_full_model', 'num_epochs_reduced_model', 'num_full_model_restarts',
         'num_genes_used', 'num_introns_used', 'num_lrt_tests_used', 'num_samples',
         'seed', 'git_revision', 'torch_version', 'torch_num_threads', 'hostname',
         'wall_time_seconds',
