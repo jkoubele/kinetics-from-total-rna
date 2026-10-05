@@ -224,7 +224,9 @@ def main() -> None:
     for column, value in run_metadata.items():
         if column not in ('experiment_description',):
             summary_df[column] = value
-    summary_df['chi2_is_negative'] = summary_df['chi2_test_statistics'] < 0
+    # An experiment that fits only the full model reports no LRTs, so there is no chi2 to sign.
+    if 'chi2_test_statistics' in summary_df.columns:
+        summary_df['chi2_is_negative'] = summary_df['chi2_test_statistics'] < 0
 
     summary_columns = [
         'experiment', 'dataset', 'model_type', 'test_id', 'tested_parameter', 'variable',
@@ -232,6 +234,7 @@ def main() -> None:
         'chi2_test_statistics', 'chi2_is_negative', 'p_value',
         'training_diverged_reduced_model', 'training_converged_within_max_epochs_reduced_model',
         'num_epochs_full_model', 'num_epochs_reduced_model', 'num_full_model_restarts',
+        'init_beta', 'init_gamma', 'final_beta', 'final_gamma',
         'num_genes_used', 'num_introns_used', 'num_lrt_tests_used', 'num_samples',
         'seed', 'git_revision', 'torch_version', 'torch_num_threads', 'hostname',
         'wall_time_seconds',
@@ -245,9 +248,12 @@ def main() -> None:
     with open(args.output_folder / 'run_metadata.json', 'w') as metadata_file:
         json.dump(run_metadata, metadata_file, indent=2)
 
-    num_negative = int(summary_df['chi2_is_negative'].sum())
-    print(f'{dataset_name} / {args.model_type} / {args.experiment}: '
-          f'{len(summary_df)} LRT results, {num_negative} with negative chi2, '
+    if 'chi2_is_negative' in summary_df.columns:
+        outcome = (f"{len(summary_df)} LRT results, "
+                   f"{int(summary_df['chi2_is_negative'].sum())} with negative chi2")
+    else:
+        outcome = f'{len(summary_df)} rows, best loss {summary_df.loss_full_model.min():.3f}'
+    print(f'{dataset_name} / {args.model_type} / {args.experiment}: {outcome}, '
           f'{wall_time_seconds:.1f} s', flush=True)
 
 

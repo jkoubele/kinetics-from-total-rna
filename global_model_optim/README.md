@@ -83,6 +83,7 @@ The acceptance criterion is `chi2_is_negative == False` everywhere: a negative c
 |---|---|
 | `experiment_001` | the current two-stage LBFGS, unchanged, with the loss curves kept |
 | `experiment_002` | refit the full model warm-started from any reduced fit that beats it, repeating until none does |
+| `experiment_003` | full model only, fitted from a grid of starting values for the shared LFCs, to test whether the optimum is global |
 
 `experiment_002` reduces exactly to `experiment_001` when no restart is triggered, so it cannot
 regress. Its knobs are module constants: `MAX_FULL_MODEL_RESTARTS` (10) and `CHI2_TOLERANCE` (0.1,
@@ -97,6 +98,15 @@ fit has to project onto `[1, X]` and absorb the leftover constant into the inter
 onto `X` alone is exact only for a two-level factor, where the reduced matrix is empty. On a
 three-level design the gap was +109 (beta) and +8254 (gamma) in a direct check, so this matters for
 any dataset with a multi-level factor -- CCR4-NOT above all.
+
+`experiment_003` runs no reduced models, so it produces no chi2 and no LRT rows. Instead it reports
+one row per grid point with `init_beta`, `init_gamma`, the loss reached, and the fitted
+`final_beta` / `final_gamma`. `INIT_GRID_VALUES` is a module constant. The grid moves every feature
+of a parameter together -- beta starts at (b, b, ...) -- since a per-feature grid is hopeless once a
+design has more than a couple of columns, and the optimizer separates the components afterwards.
+
+`--datasets` takes a comma-separated list of dataset folder names, so a run can target one dataset
+without rearranging `data_dir`.
 
 ## Adding an experiment
 

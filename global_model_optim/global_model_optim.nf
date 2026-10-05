@@ -66,7 +66,9 @@ frames = [pd.read_csv(path, sep='\\t') for path in sys.argv[1:]]
 combined = pd.concat(frames, ignore_index=True)
 combined = combined.sort_values(['experiment', 'model_type', 'dataset', 'test_id', 'tested_parameter'])
 combined.to_csv('all_summaries.tsv', sep='\\t', index=False)
-print(f'{len(combined)} rows, {int(combined.chi2_is_negative.sum())} with negative chi2')
+# chi2_is_negative is absent when every experiment in the run fits the full model only.
+negatives = int(combined['chi2_is_negative'].fillna(False).sum()) if 'chi2_is_negative' in combined else 0
+print(f'{len(combined)} rows, {negatives} with negative chi2')
 " ${summary_files}
     """
 }
@@ -74,6 +76,7 @@ print(f'{len(combined)} rows, {int(combined.chi2_is_negative.sum())} with negati
 workflow {
     def experiment_names = params.experiments.tokenize(',').collect { it.trim() }
     def model_type_names = params.model_types.tokenize(',').collect { it.trim() }
+    def selected_dataset_names = params.datasets ? params.datasets.tokenize(',').collect { it.trim() } : null
 
     // Each invocation gets its own results_NNN folder, so runs at different settings sit side by
     // side instead of overwriting each other. The settings themselves go into run_spec.json rather
@@ -117,6 +120,9 @@ workflow {
                 error "No dataset folders found in ${params.data_dir}/${model_type}_models/"
             }
             dataset_dirs.collect { dataset_dir -> [model_type, dataset_dir.name, dataset_dir] }
+        }
+        .filter { model_type, dataset_name, dataset_dir ->
+            params.datasets == null || dataset_name in selected_dataset_names
         }
 
     run_channel = dataset_channel
