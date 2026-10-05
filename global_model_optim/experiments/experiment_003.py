@@ -1,7 +1,16 @@
-"""Experiment 003 - map the loss surface in beta and gamma by starting the full fit from a grid.
+"""Experiment 003 - does the beta/gamma initialisation matter at all?
 
-No reduced models and no LRTs: this fits the full model only, repeatedly, from different starting
-values of the two shared LFCs. Those are the only parameters `initialize_parameters` leaves
+No reduced models, no LRTs, and **stage 1 only**. The two-stage schedule optimises the shared LFCs
+first with every per-gene parameter frozen, then unfreezes everything. Since the frozen parameters
+come from a deterministic heuristic, the state entering stage 2 is fully determined by where stage 1
+lands. So if stage 1 converges to the same beta/gamma from every start, the initialisation cannot
+matter and there is no reason to pay for stage 2 at all; if it does not, the whole fit is
+init-dependent and that has to be dealt with.
+
+Running only stage 1 makes each grid point cheap: stage 1 terminated after 4 epochs in all 18
+full-model fits of the full-scale run, against up to 279 epochs for stage 2.
+
+The grid varies the starting values of the two shared LFCs. Those are the only parameters `initialize_parameters` leaves
 uninformed -- it derives `intercept_exon`, `lfc_init_over_deg` (Poisson GLM), `intercept_pi_logit`
 (grid search over pi) and `intercept_intron` from the data, but `lfc_elong_over_deg` and
 `lfc_splice_over_deg` start at exactly zero. Zero is a default, not a principled choice, so varying
@@ -11,9 +20,13 @@ The question is whether the optimum experiment_002 reaches is the global one. We
 surface has more than one basin -- experiment_002 found better optima than the heuristic start in 15
 of 81 full-scale tests, with loss gains up to 18565 -- so this is quantitative, not exploratory.
 
-Each grid point is reported as its own row, with the starting values, the loss reached, and the
-fitted LFCs. If every start converges to the same loss and the same LFCs, the optimum is very likely
-global. If they scatter, everything resting on the global model is provisional.
+Each grid point is reported as its own row, with the starting values, the loss reached after stage 1
+(in `loss_full_model`) and the stage-1 fitted LFCs. The column to read is `final_beta` /
+`final_gamma`: identical values across the grid mean the initialisation is irrelevant.
+
+⚠ This tests init-independence, not global optimality. Stage 1 holds the per-gene parameters at
+their heuristic values, so it says nothing about multimodality in the joint surface that stage 2
+explores.
 
 The grid perturbs all features of a parameter together: for a design with several columns, beta
 starts at (b, b, ...) and gamma at (g, g, ...). That explores the overall-shift directions, which is
@@ -33,27 +46,30 @@ from rna_kinetics.estimation import (
     TrainingResults,
     _make_global_rna_kinetics_closures,
     _make_intron_coverage_closures,
-    make_lbfgs_optimizer,
     train_model,
 )
 from rna_kinetics.models import GlobalRNAKineticsModel, IntronCoverageModel
 
-EXPERIMENT_DESCRIPTION = ('Full model only, fitted from a grid of starting values for the shared '
-                          'LFCs, to test whether the optimum is global.')
+EXPERIMENT_DESCRIPTION = ('Stage 1 only, from a grid of starting values for the shared LFCs, to test '
+                          'whether the initialisation changes where stage 1 lands.')
 
 # Natural-log LFCs. Fitted values across the nine datasets span roughly 0 to -3.4, so this covers
 # the observed range in both directions.
 INIT_GRID_VALUES = (-3.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0)
 
 
-def _train_two_stage_with_log(
+def _train_stage_1_only_with_log(
         model: nn.Module,
         global_param_names: set[str],
         make_closures: Callable[[optim.Optimizer], tuple[Callable, Callable]],
         fit_label: str,
         verbose: bool = False,
 ) -> tuple[nn.Module, TrainingResults, list[dict]]:
-    """The same two-stage schedule as experiment_001 and _002, so the runs stay comparable."""
+    """Stage 1 of the usual schedule, with stage 2 deliberately left out.
+
+    Identical to the stage 1 in experiment_001 and _002 -- same optimizer settings, same frozen
+    parameters -- so the landing points are directly comparable to those runs.
+    """
     training_log: list[dict] = []
 
     def record(stage: str, training_results: TrainingResults) -> None:
@@ -69,26 +85,17 @@ def _train_two_stage_with_log(
     for name, param in model.named_parameters():
         param.requires_grad_(name in global_param_names)
     stage_1_params = [p for p in model.parameters() if p.requires_grad and p.numel() > 0]
-    if stage_1_params:
-        optimizer_stage_1 = optim.LBFGS(
-            stage_1_params,
-            lr=1.0, max_iter=20, tolerance_change=1e-9, tolerance_grad=1e-7,
-            history_size=100, line_search_fn='strong_wolfe',
-        )
-        closure_stage_1, evaluate_stage_1 = make_closures(optimizer_stage_1)
-        model, results_stage_1 = train_model(model, optimizer_stage_1, closure_stage_1, evaluate_stage_1,
-                                             max_epochs=500, verbose=verbose)
-        record('stage_1', results_stage_1)
-
-    for param in model.parameters():
-        param.requires_grad_(True)
-    optimizer_stage_2 = make_lbfgs_optimizer(model)
-    closure_stage_2, evaluate_stage_2 = make_closures(optimizer_stage_2)
-    model, results_stage_2 = train_model(model, optimizer_stage_2, closure_stage_2, evaluate_stage_2,
+    optimizer_stage_1 = optim.LBFGS(
+        stage_1_params,
+        lr=1.0, max_iter=20, tolerance_change=1e-9, tolerance_grad=1e-7,
+        history_size=100, line_search_fn='strong_wolfe',
+    )
+    closure_stage_1, evaluate_stage_1 = make_closures(optimizer_stage_1)
+    model, results_stage_1 = train_model(model, optimizer_stage_1, closure_stage_1, evaluate_stage_1,
                                          max_epochs=500, verbose=verbose)
-    record('stage_2', results_stage_2)
+    record('stage_1', results_stage_1)
 
-    return model, results_stage_2, training_log
+    return model, results_stage_1, training_log
 
 
 def _format_vector(tensor: torch.Tensor) -> str:
@@ -123,7 +130,7 @@ def fit_global_rna_kinetics(
             model.lfc_splice_over_deg.fill_(init_gamma)
 
         fit_label = f'init_beta_{init_beta}_gamma_{init_gamma}'
-        model, results, log = _train_two_stage_with_log(
+        model, results, log = _train_stage_1_only_with_log(
             model,
             global_param_names={'lfc_elong_over_deg', 'lfc_splice_over_deg'},
             make_closures=lambda opt: _make_global_rna_kinetics_closures(
@@ -184,7 +191,7 @@ def fit_global_intron_coverage(
             model.lfc_elong_over_splice.fill_(init_value)
 
         fit_label = f'init_elong_over_splice_{init_value}'
-        model, results, log = _train_two_stage_with_log(
+        model, results, log = _train_stage_1_only_with_log(
             model,
             global_param_names={'lfc_elong_over_splice'},
             make_closures=lambda opt: _make_intron_coverage_closures(

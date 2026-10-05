@@ -83,7 +83,7 @@ The acceptance criterion is `chi2_is_negative == False` everywhere: a negative c
 |---|---|
 | `experiment_001` | the current two-stage LBFGS, unchanged, with the loss curves kept |
 | `experiment_002` | refit the full model warm-started from any reduced fit that beats it, repeating until none does |
-| `experiment_003` | full model only, fitted from a grid of starting values for the shared LFCs, to test whether the optimum is global |
+| `experiment_003` | **stage 1 only**, from a grid of starting values for the shared LFCs, to test whether the initialisation changes where stage 1 lands |
 
 `experiment_002` reduces exactly to `experiment_001` when no restart is triggered, so it cannot
 regress. Its knobs are module constants: `MAX_FULL_MODEL_RESTARTS` (10) and `CHI2_TOLERANCE` (0.1,
@@ -99,9 +99,13 @@ onto `X` alone is exact only for a two-level factor, where the reduced matrix is
 three-level design the gap was +109 (beta) and +8254 (gamma) in a direct check, so this matters for
 any dataset with a multi-level factor -- CCR4-NOT above all.
 
-`experiment_003` runs no reduced models, so it produces no chi2 and no LRT rows. Instead it reports
-one row per grid point with `init_beta`, `init_gamma`, the loss reached, and the fitted
-`final_beta` / `final_gamma`. `INIT_GRID_VALUES` is a module constant. The grid moves every feature
+`experiment_003` runs no reduced models and stops after stage 1, so it produces no chi2 and no LRT
+rows. It reports one row per grid point with `init_beta`, `init_gamma`, the loss reached after
+stage 1 (in `loss_full_model`) and the stage-1 `final_beta` / `final_gamma`. Stage 1 freezes every
+per-gene parameter at its deterministic heuristic value, so the state entering stage 2 is fully
+determined by where stage 1 lands: identical landing points mean the initialisation cannot matter
+and stage 2 need not be paid for. Stage 1 takes 4-5 epochs against up to 279 for stage 2, so the
+whole grid is cheap. `INIT_GRID_VALUES` is a module constant. The grid moves every feature
 of a parameter together -- beta starts at (b, b, ...) -- since a per-feature grid is hopeless once a
 design has more than a couple of columns, and the optimizer separates the components afterwards.
 
