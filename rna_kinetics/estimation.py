@@ -99,8 +99,11 @@ def train_model(
         previous_loss = loss
 
     model.load_state_dict(best_state_dict)
+    # best_loss, not the last epoch's loss: the model is restored to the best state, and the two
+    # differ whenever the run ended on a worse epoch -- most obviously when it diverged, where the
+    # last loss is non-finite while the returned parameters are the finite best.
     training_results = TrainingResults(
-        final_loss=loss,
+        final_loss=best_loss,
         converged_within_max_epochs=converged_within_max_epochs,
         num_epochs=epoch + 1,
         losses=losses,
