@@ -38,7 +38,7 @@ PARAMETER_WIRE_NAMES = {
     'lfc_elong_over_deg': 'beta',
     'lfc_splice_over_deg': 'gamma',
     'lfc_elong_over_splice': 'lfc',
-    'intercept_intron': 'intercept_intron',
+    'intercept_unspliced': 'intercept_unspliced',
     'intercept_pi_logit': 'theta',
 }
 
@@ -214,7 +214,7 @@ class RNAKineticsModel(nn.Module):
             self.lfc_splice_over_deg = nn.Parameter(torch.zeros(num_features, 1))
         self.intron_specific_lfc = intron_specific_lfc
 
-        self.intercept_intron = nn.Parameter(torch.zeros(num_introns))
+        self.intercept_unspliced = nn.Parameter(torch.zeros(num_introns))
         self.intercept_pi_logit = nn.Parameter(torch.zeros(num_introns))
 
         self.lrt_specification = lrt_specification
@@ -245,9 +245,9 @@ class RNAKineticsModel(nn.Module):
             best_pi = estimate_initial_pi(gene_data.coverage, pi_eps, num_pi_grid_points)
             self.intercept_pi_logit.data.copy_(torch.logit(best_pi, eps=pi_eps))
 
-            intercept_intron_vector = torch.log(
+            intercept_unspliced_vector = torch.log(
                 gene_data.intron_reads.mean(dim=0) / library_sizes.mean() * (1 - best_pi))
-            self.intercept_intron.data.copy_(intercept_intron_vector)
+            self.intercept_unspliced.data.copy_(intercept_unspliced_vector)
 
     def forward(self,
                 design_matrix: torch.Tensor,
@@ -284,10 +284,16 @@ class RNAKineticsModel(nn.Module):
 
         predicted_pi = torch.sigmoid(self.intercept_pi_logit - elong_over_deg_term + splice_over_deg_term)
 
-        log_intron_baseline = self.intercept_intron + log_library_sizes.unsqueeze(
-            1) + init_over_deg_term.unsqueeze(1)
-        reads_nascent_intron = safe_exp(log_intron_baseline + self.intercept_pi_logit - elong_over_deg_term)
-        reads_unspliced_intron = safe_exp(log_intron_baseline - splice_over_deg_term)
+        # Both intron arms carry the same library-size and initiation offsets; they differ only in
+        # their intercept and in which rate ratio divides them. Naming the nascent intercept makes
+        # intercept_pi_logit's role explicit: it is how far the nascent baseline sits above the
+        # unspliced one, which is exactly the baseline logit of the nascent fraction.
+        shared_intron_offset = log_library_sizes.unsqueeze(1) + init_over_deg_term.unsqueeze(1)
+        intercept_nascent = self.intercept_unspliced + self.intercept_pi_logit
+
+        reads_nascent_intron = safe_exp(intercept_nascent + shared_intron_offset - elong_over_deg_term)
+        reads_unspliced_intron = safe_exp(
+            self.intercept_unspliced + shared_intron_offset - splice_over_deg_term)
         predicted_reads_intron = reads_nascent_intron + reads_unspliced_intron
 
         return safe_exp(predicted_log_reads_exon), predicted_reads_intron, predicted_pi
@@ -299,7 +305,7 @@ class RNAKineticsModel(nn.Module):
             'lfc_init_over_deg': ('feature',),
             'lfc_elong_over_deg': ('feature', lfc_intron_axis),
             'lfc_splice_over_deg': ('feature', lfc_intron_axis),
-            'intercept_intron': ('intron',),
+            'intercept_unspliced': ('intron',),
             'intercept_pi_logit': ('intron',),
         })
 
@@ -369,7 +375,7 @@ class GlobalRNAKineticsModel(nn.Module):
         self.lfc_elong_over_deg = nn.Parameter(torch.zeros(num_features))
         self.lfc_splice_over_deg = nn.Parameter(torch.zeros(num_features))
         self.intercept_exon = nn.Parameter(torch.zeros(num_genes))
-        self.intercept_intron = nn.Parameter(torch.zeros(num_introns))
+        self.intercept_unspliced = nn.Parameter(torch.zeros(num_introns))
         self.intercept_pi_logit = nn.Parameter(torch.zeros(num_introns))
 
         self.register_buffer('gene_idx', gene_idx)
@@ -404,7 +410,7 @@ class GlobalRNAKineticsModel(nn.Module):
             best_pi = estimate_initial_pi(global_gene_data.coverage, pi_eps, num_pi_grid_points)
             self.intercept_pi_logit.data.copy_(torch.logit(best_pi, eps=pi_eps))
 
-            self.intercept_intron.data.copy_(
+            self.intercept_unspliced.data.copy_(
                 torch.log(global_gene_data.intron_reads.mean(dim=0) / library_sizes.mean() * (1 - best_pi))
             )
 
@@ -441,15 +447,17 @@ class GlobalRNAKineticsModel(nn.Module):
 
         init_over_deg_per_intron = init_over_deg_term[:, self.gene_idx]  # (num_samples, num_introns)
 
-        log_intron_baseline = (
-                self.intercept_intron
-                + log_library_sizes.unsqueeze(1)
-                + init_over_deg_per_intron
-        )
+        # Both intron arms carry the same library-size and initiation offsets; they differ only in
+        # their intercept and in which rate ratio divides them. Naming the nascent intercept makes
+        # intercept_pi_logit's role explicit: it is how far the nascent baseline sits above the
+        # unspliced one, which is exactly the baseline logit of the nascent fraction.
+        shared_intron_offset = log_library_sizes.unsqueeze(1) + init_over_deg_per_intron
+        intercept_nascent = self.intercept_unspliced + self.intercept_pi_logit
 
         predicted_pi = torch.sigmoid(self.intercept_pi_logit - elong_over_deg_term + splice_over_deg_term)
-        reads_nascent_intron = safe_exp(log_intron_baseline + self.intercept_pi_logit - elong_over_deg_term)
-        reads_unspliced_intron = safe_exp(log_intron_baseline - splice_over_deg_term)
+        reads_nascent_intron = safe_exp(intercept_nascent + shared_intron_offset - elong_over_deg_term)
+        reads_unspliced_intron = safe_exp(
+            self.intercept_unspliced + shared_intron_offset - splice_over_deg_term)
         predicted_reads_intron = reads_nascent_intron + reads_unspliced_intron
 
         return safe_exp(predicted_log_reads_exon), predicted_reads_intron, predicted_pi
@@ -460,7 +468,7 @@ class GlobalRNAKineticsModel(nn.Module):
             'lfc_init_over_deg': ('gene', 'feature'),
             'lfc_elong_over_deg': ('feature',),
             'lfc_splice_over_deg': ('feature',),
-            'intercept_intron': ('intron',),
+            'intercept_unspliced': ('intron',),
             'intercept_pi_logit': ('intron',),
         })
 
