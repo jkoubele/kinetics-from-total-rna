@@ -21,37 +21,62 @@ def safe_exp(x: torch.Tensor, output_threshold: float = 1e20) -> torch.Tensor:
     )
 
 
-class TestableParameters(StrEnum):
-    ALPHA = 'alpha'
-    BETA = 'beta'
-    GAMMA = 'gamma'
+class LFCParameter(StrEnum):
+    """
+    The models' log fold change parameters, by attribute name.
+
+    Separate from TestedRatio, which enumerates hypotheses rather than parameters, though every
+    parameter here is also a tested ratio under the same name. The two tested ratios that are not
+    parameters, init/elong and init/splice, are differences of two.
+    """
+    INIT_OVER_DEG = 'lfc_init_over_deg'
+    ELONG_OVER_DEG = 'lfc_elong_over_deg'
+    SPLICE_OVER_DEG = 'lfc_splice_over_deg'
+    ELONG_OVER_SPLICE = 'lfc_elong_over_splice'
 
 
-# Stable output vocabulary: the values written to the `parameter_type` column, which
-# `merge_regularization.R` joins against `tested_parameter`. Deliberately decoupled from the
-# attribute names, so those can be renamed without touching any R script or output schema.
-# TODO: 'theta' is a leftover name for intercept_pi_logit; renaming it is a schema change and
-# belongs with the LRT refactor, when the R side is being touched anyway.
-PARAMETER_WIRE_NAMES = {
-    'intercept_exon': 'intercept_exon',
-    'lfc_init_over_deg': 'alpha',
-    'lfc_elong_over_deg': 'beta',
-    'lfc_splice_over_deg': 'gamma',
-    'lfc_elong_over_splice': 'lfc',
-    'intercept_unspliced': 'intercept_unspliced',
-    'intercept_pi_logit': 'theta',
+class TestedRatio(StrEnum):
+    """
+    Which rate ratio an LRT restricts.
+
+    All six ratios of the four rates are testable. Three of them are model parameters; the other
+    three are differences of two parameters, which is well-defined because every parameter is a
+    ratio against degradation, so the degradation term cancels in the difference.
+
+    The values are the LFC attribute names, and are written verbatim to the `tested_parameter`
+    column of the test results and on into the volcano plot paths. The three ratios that are not
+    parameters have no attribute of their own, but are named the same way.
+    """
+    INIT_OVER_DEG = 'lfc_init_over_deg'
+    ELONG_OVER_DEG = 'lfc_elong_over_deg'
+    SPLICE_OVER_DEG = 'lfc_splice_over_deg'
+    INIT_OVER_ELONG = 'lfc_init_over_elong'
+    INIT_OVER_SPLICE = 'lfc_init_over_splice'
+    ELONG_OVER_SPLICE = 'lfc_elong_over_splice'
+
+
+# Each tested ratio as a difference of LFC parameters, with None for a ratio that is a single
+# parameter. Used to build the reduced model's hot start and to report the effect size, both of
+# which need the full model's value of the ratio rather than of one parameter.
+RATIO_AS_LFC_DIFFERENCE: dict[TestedRatio, tuple[LFCParameter, Optional[LFCParameter]]] = {
+    TestedRatio.INIT_OVER_DEG: (LFCParameter.INIT_OVER_DEG, None),
+    TestedRatio.ELONG_OVER_DEG: (LFCParameter.ELONG_OVER_DEG, None),
+    TestedRatio.SPLICE_OVER_DEG: (LFCParameter.SPLICE_OVER_DEG, None),
+    TestedRatio.INIT_OVER_ELONG: (LFCParameter.INIT_OVER_DEG, LFCParameter.ELONG_OVER_DEG),
+    TestedRatio.INIT_OVER_SPLICE: (LFCParameter.INIT_OVER_DEG, LFCParameter.SPLICE_OVER_DEG),
+    TestedRatio.ELONG_OVER_SPLICE: (LFCParameter.ELONG_OVER_DEG, LFCParameter.SPLICE_OVER_DEG),
 }
 
-TESTED_PARAMETER_TO_ATTRIBUTE = {
-    TestableParameters.ALPHA: 'lfc_init_over_deg',
-    TestableParameters.BETA: 'lfc_elong_over_deg',
-    TestableParameters.GAMMA: 'lfc_splice_over_deg',
-}
+# The global model's lfc_init_over_deg is per gene rather than shared, so no ratio involving
+# initiation describes a single genome-wide effect and only these three can be tested there.
+GLOBAL_MODEL_TESTED_RATIOS = (TestedRatio.ELONG_OVER_DEG,
+                              TestedRatio.SPLICE_OVER_DEG,
+                              TestedRatio.ELONG_OVER_SPLICE)
 
 
 class LRTSpecification(NamedTuple):
     num_features_reduced_matrix: int
-    tested_parameter: TestableParameters
+    tested_ratio: TestedRatio
     tested_intron: Optional[str] = None
 
 
@@ -118,7 +143,9 @@ def build_param_df(model: nn.Module, parameter_axes: dict[str, tuple[Optional[st
         index_ranges = [range(1) if axis is None else range(len(axis_to_names[axis])) for axis in axes]
         num_rows_before = len(parameter_data)
         for index_combination in itertools.product(*index_ranges):
-            row = {'parameter_type': PARAMETER_WIRE_NAMES[param_name]}
+            # parameter_type is the attribute name itself, which is also what reaches the
+            # output TSVs and the volcano plot paths, so renaming a parameter is a schema change.
+            row = {'parameter_type': param_name}
             row.update({f'{axis}_name': None for axis in emitted_axes})
             for axis, axis_index in zip(axes, index_combination):
                 if axis is not None:
@@ -221,10 +248,11 @@ class RNAKineticsModel(nn.Module):
         self.tested_intron_index: Optional[int] = None
         if lrt_specification is not None:
             self.reduced_lfc = nn.Parameter(torch.zeros(lrt_specification.num_features_reduced_matrix))
-            # Only intron-specific LFC parameters (elongation, splicing) are tested per intron;
-            # lfc_init_over_deg is shared across the gene, so it has no tested intron.
+            # Every ratio except init/deg involves elongation or splicing, whose LFCs can be
+            # intron-specific, so those are tested one intron at a time. init/deg involves only
+            # lfc_init_over_deg, which is shared across the gene, so it has no tested intron.
             tests_single_intron = (intron_specific_lfc
-                                   and lrt_specification.tested_parameter != TestableParameters.ALPHA)
+                                   and lrt_specification.tested_ratio != TestedRatio.INIT_OVER_DEG)
             if tests_single_intron:
                 self.tested_intron_index = self.intron_names.index(lrt_specification.tested_intron)
 
@@ -249,10 +277,10 @@ class RNAKineticsModel(nn.Module):
                 gene_data.intron_reads.mean(dim=0) / library_sizes.mean() * (1 - best_pi))
             self.intercept_unspliced.data.copy_(intercept_unspliced_vector)
 
-    def _get_lfc_terms_per_read_class(self,
-                                      design_matrix: torch.Tensor,
-                                      reduced_design_matrix: Optional[torch.Tensor]
-                                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_lfc_terms_per_read_class(self,
+                                     design_matrix: torch.Tensor,
+                                     reduced_design_matrix: Optional[torch.Tensor]
+                                     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         LFC term of each read class the model predicts. Unrestricted, the three are
 
@@ -283,9 +311,9 @@ class RNAKineticsModel(nn.Module):
         # Stands in for whichever LFC is under test, so below it is used in exactly the position
         # that LFC occupies in the unrestricted terms.
         reduced_lfc_term = reduced_design_matrix @ self.reduced_lfc  # (num_samples,)
-        tested_parameter = self.lrt_specification.tested_parameter
+        tested_ratio = self.lrt_specification.tested_ratio
 
-        if tested_parameter == TestableParameters.ALPHA:
+        if tested_ratio == TestedRatio.INIT_OVER_DEG:
             # alpha feeds all three read classes and is never intron-specific, so all three are
             # rebuilt. It enters each of them positively.
             reduced_init_per_intron = reduced_lfc_term.unsqueeze(1)
@@ -296,19 +324,43 @@ class RNAKineticsModel(nn.Module):
         init_over_deg_per_intron = init_over_deg_term.unsqueeze(1)
         nascent_term = init_over_deg_per_intron - elong_over_deg_term
         unspliced_term = init_over_deg_per_intron - splice_over_deg_term
+        reduced_per_intron = reduced_lfc_term.unsqueeze(1)
 
-        # beta and gamma are each subtracted from the initiation term in their own read class, so
-        # the restricted read class is that same expression with the reduced term in their place.
-        if tested_parameter == TestableParameters.BETA:
+        # Each remaining ratio is restricted by rebuilding one intron read class from the reduced
+        # term, in the place that ratio occupies:
+        #   elong/deg  = init - nascent      so the nascent class becomes init - reduced
+        #   splice/deg = init - unspliced    so the unspliced class becomes init - reduced
+        #   init/elong = nascent             so the nascent class becomes the reduced term itself
+        #   init/splice = unspliced          so the unspliced class becomes the reduced term
+        #   elong/splice = unspliced - nascent    so the unspliced class becomes nascent + reduced
+        if tested_ratio == TestedRatio.ELONG_OVER_DEG:
             nascent_term = self._get_restricted_intron_term(
-                nascent_term, init_over_deg_per_intron - reduced_lfc_term.unsqueeze(1))
-        elif tested_parameter == TestableParameters.GAMMA:
+                nascent_term, init_over_deg_per_intron - reduced_per_intron)
+        elif tested_ratio == TestedRatio.SPLICE_OVER_DEG:
             unspliced_term = self._get_restricted_intron_term(
-                unspliced_term, init_over_deg_per_intron - reduced_lfc_term.unsqueeze(1))
+                unspliced_term, init_over_deg_per_intron - reduced_per_intron)
+        elif tested_ratio == TestedRatio.INIT_OVER_ELONG:
+            nascent_term = self._get_restricted_intron_term(nascent_term, reduced_per_intron)
+        elif tested_ratio == TestedRatio.INIT_OVER_SPLICE:
+            unspliced_term = self._get_restricted_intron_term(unspliced_term, reduced_per_intron)
+        elif tested_ratio == TestedRatio.ELONG_OVER_SPLICE:
+            unspliced_term = self._get_restricted_intron_term(
+                unspliced_term,
+                self._get_tested_intron_column(nascent_term) + reduced_per_intron)
         else:
-            raise ValueError(f'Unhandled tested parameter: {tested_parameter!r}')
+            raise ValueError(f'Unhandled tested ratio: {tested_ratio!r}')
 
         return init_over_deg_term, nascent_term, unspliced_term
+
+    def _get_tested_intron_column(self, full_term: torch.Tensor) -> torch.Tensor:
+        """
+        The tested intron's column of an intron-axis term, kept two-dimensional. With LFCs shared
+        across introns there is only one column, which is the term itself.
+        """
+        if not self.intron_specific_lfc:
+            return full_term
+        intron_index = self.tested_intron_index
+        return full_term[:, intron_index:intron_index + 1]
 
     def _get_restricted_intron_term(self, full_term: torch.Tensor,
                                     restricted_term: torch.Tensor) -> torch.Tensor:
@@ -333,7 +385,7 @@ class RNAKineticsModel(nn.Module):
                 log_library_sizes: torch.Tensor,
                 isoform_length_offset: torch.Tensor,
                 reduced_design_matrix: Optional[torch.Tensor] = None):
-        lfc_term_exon, lfc_term_nascent, lfc_term_unspliced = self._get_lfc_terms_per_read_class(
+        lfc_term_exon, lfc_term_nascent, lfc_term_unspliced = self.get_lfc_terms_per_read_class(
             design_matrix, reduced_design_matrix)
 
         predicted_log_reads_exon = (self.intercept_exon + log_library_sizes
@@ -444,10 +496,10 @@ class GlobalRNAKineticsModel(nn.Module):
 
         self.lrt_specification = lrt_specification
         if lrt_specification is not None:
-            if lrt_specification.tested_parameter not in (TestableParameters.BETA, TestableParameters.GAMMA):
+            if lrt_specification.tested_ratio not in GLOBAL_MODEL_TESTED_RATIOS:
                 raise ValueError(
-                    f"GlobalRNAKineticsModel LRT only supports BETA and GAMMA, "
-                    f"got {lrt_specification.tested_parameter!r}.")
+                    f"GlobalRNAKineticsModel LRT supports only {GLOBAL_MODEL_TESTED_RATIOS}, "
+                    f"got {lrt_specification.tested_ratio!r}.")
             self.reduced_lfc = nn.Parameter(torch.zeros(lrt_specification.num_features_reduced_matrix))
 
     def initialize_parameters(self,
@@ -476,10 +528,10 @@ class GlobalRNAKineticsModel(nn.Module):
                 torch.log(global_gene_data.intron_reads.mean(dim=0) / library_sizes.mean() * (1 - best_pi))
             )
 
-    def _get_lfc_terms_per_read_class(self,
-                                      design_matrix: torch.Tensor,
-                                      reduced_design_matrix: Optional[torch.Tensor]
-                                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_lfc_terms_per_read_class(self,
+                                     design_matrix: torch.Tensor,
+                                     reduced_design_matrix: Optional[torch.Tensor]
+                                     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         LFC term of each read class the model predicts, shaped (num_samples, num_genes),
         (num_samples, num_introns) and (num_samples, num_introns).
@@ -500,16 +552,20 @@ class GlobalRNAKineticsModel(nn.Module):
         if self.lrt_specification is not None:
             if reduced_design_matrix is None:
                 raise ValueError("reduced_design_matrix must be provided in LRT mode.")
-            # Stands in for whichever LFC is under test, used in the position that LFC occupies:
-            # beta and gamma are each subtracted from the initiation term in their own read class.
+            # Stands in for whichever LFC is under test, used in the place that ratio occupies:
+            #   elong/deg    = init - nascent          so nascent becomes init - reduced
+            #   splice/deg   = init - unspliced        so unspliced becomes init - reduced
+            #   elong/splice = unspliced - nascent     so unspliced becomes nascent + reduced
             reduced_lfc_term = (reduced_design_matrix @ self.reduced_lfc).unsqueeze(1)
-            tested_parameter = self.lrt_specification.tested_parameter
-            if tested_parameter == TestableParameters.BETA:
+            tested_ratio = self.lrt_specification.tested_ratio
+            if tested_ratio == TestedRatio.ELONG_OVER_DEG:
                 nascent_term = init_over_deg_per_intron - reduced_lfc_term
-            elif tested_parameter == TestableParameters.GAMMA:
+            elif tested_ratio == TestedRatio.SPLICE_OVER_DEG:
                 unspliced_term = init_over_deg_per_intron - reduced_lfc_term
+            elif tested_ratio == TestedRatio.ELONG_OVER_SPLICE:
+                unspliced_term = nascent_term + reduced_lfc_term
             else:
-                raise ValueError(f'Unhandled tested parameter: {tested_parameter!r}')
+                raise ValueError(f'Unhandled tested ratio: {tested_ratio!r}')
 
         return init_over_deg_term, nascent_term, unspliced_term
 
@@ -518,7 +574,7 @@ class GlobalRNAKineticsModel(nn.Module):
                 log_library_sizes: torch.Tensor,
                 isoform_length_offset: torch.Tensor,
                 reduced_design_matrix: Optional[torch.Tensor] = None):
-        lfc_term_exon, lfc_term_nascent, lfc_term_unspliced = self._get_lfc_terms_per_read_class(
+        lfc_term_exon, lfc_term_nascent, lfc_term_unspliced = self.get_lfc_terms_per_read_class(
             design_matrix, reduced_design_matrix)
 
         predicted_log_reads_exon = (

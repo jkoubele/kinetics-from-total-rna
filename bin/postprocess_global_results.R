@@ -16,31 +16,24 @@ args <- parser$parse_args()
 output_folder <- args$output_folder
 if (!dir.exists(output_folder)) dir.create(output_folder, recursive = TRUE)
 
-# Names match the model parameter attributes in rna_kinetics/models.py. Each is a log fold
-# change of a ratio of two rates, which is why none of them is a rate change on its own.
+# Keyed by parameter_type, which Python writes: these must stay in step with TestedRatio and the
+# LFC attribute names in rna_kinetics/models.py, or the plot falls back to the raw name. Each is a
+# log fold change of a ratio of two rates, which is why none of them is a rate change on its own.
 parameter_type_subtitles <- c(
+  lfc_init_over_deg     = "LFC(initiation rate) − LFC(degradation rate)",
   lfc_elong_over_deg    = "LFC(elongation speed) − LFC(degradation rate)",
   lfc_splice_over_deg   = "LFC(splicing speed) − LFC(degradation rate)",
+  lfc_init_over_elong   = "LFC(initiation rate) − LFC(elongation speed)",
+  lfc_init_over_splice  = "LFC(initiation rate) − LFC(splicing speed)",
   lfc_elong_over_splice = "LFC(elongation speed) − LFC(splicing speed)"
 )
 
 test_results <- read_tsv(args$test_results)
 
-if (args$model_type == "global_rna_kinetics") {
-  test_results <- test_results |>
-    mutate(
-      parameter_type = case_when(
-        tested_parameter == "beta"  ~ "lfc_elong_over_deg",
-        tested_parameter == "gamma" ~ "lfc_splice_over_deg",
-        TRUE                        ~ tested_parameter
-      ),
-    ) |>
-    select(-tested_parameter)
-} else {
-  test_results <- test_results |>
-    mutate(parameter_type = "lfc_elong_over_splice") |>
-    select(-tested_parameter)
-}
+# The global rna_kinetics model names the tested ratio itself, so the column only needs
+# renaming. The global intron coverage model tests its single LFC, which the column already names.
+test_results <- test_results |>
+  rename(parameter_type = tested_parameter)
 
 test_results <- test_results |>
   mutate(

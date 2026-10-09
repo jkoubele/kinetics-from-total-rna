@@ -42,6 +42,13 @@ write_tsv(regularized_model_parameters_merged_df,
 
 test_results <- read_tsv(args$test_results)
 
+# TODO: broken for the three tested ratios that are not model parameters
+# (lfc_init_over_elong, lfc_init_over_splice, lfc_elong_over_splice). They have no parameter_type
+# row to join against, so the join below yields NA and the replace_na turns it into a regularized
+# LFC of exactly 0, which reads as a real estimate of no effect. The intended fix is for Python to
+# emit the regularized LFC per tested ratio, rather than having R rebuild it from the parameter
+# table. Note the replace_na below is correct for its other case, a reference level contributing
+# zero, so the two situations cannot be told apart after the join.
 lfc_value_positive <- test_results |>
   left_join(
     regularized_model_parameters_merged_df,

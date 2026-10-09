@@ -10,9 +10,9 @@ from torch import nn, optim
 from torch.func import functional_call, hessian
 
 from rna_kinetics.data import GeneData, IntronData, DatasetMetadata, GlobalGeneData
-from rna_kinetics.models import RNAKineticsLoss, RNAKineticsModel, TestableParameters, LRTSpecification, \
-    IntronCoverageModel, CoverageLoss, GlobalRNAKineticsModel, TESTED_PARAMETER_TO_ATTRIBUTE, \
-    PARAMETER_WIRE_NAMES
+from rna_kinetics.models import RNAKineticsLoss, RNAKineticsModel, TestedRatio, LRTSpecification, \
+    IntronCoverageModel, CoverageLoss, GlobalRNAKineticsModel, RATIO_AS_LFC_DIFFERENCE, \
+    GLOBAL_MODEL_TESTED_RATIOS, LFCParameter
 
 LOSS_CLAMP_VALUE = 1e30
 
@@ -37,6 +37,82 @@ class CacheForRegularization:
     # IntronCoverageModel only: whether its single LFC belongs to one named intron rather than
     # being shared across a gene's introns. Not an architecture flag -- it only affects labelling.
     lfc_is_intron_specific: bool = False
+
+
+def _get_lfc_without_intron_axis(lfc: torch.Tensor, intron_index: int) -> torch.Tensor:
+    """One LFC parameter as a (num_features,) vector, dropping the intron axis where it has one."""
+    return lfc if lfc.dim() == 1 else lfc[:, intron_index]
+
+
+def get_lfc_of_tested_ratio(state_dict: StateDict,
+                            tested_ratio: TestedRatio,
+                            intron_index: int = 0) -> torch.Tensor:
+    """
+    The fitted LFC of the rate ratio under test, as a (num_features,) vector.
+
+    Three of the six ratios are single parameters; the other three are a difference of two, which
+    is well defined because both are measured against degradation and that term cancels. The
+    elongation and splicing LFCs may carry an intron axis, in which case the tested intron's
+    column is taken; initiation never does.
+
+    Used both to hot start the reduced model and to report the tested ratio's effect size, neither
+    of which can read a single parameter for the three unparametrized ratios.
+    """
+    numerator_attribute, denominator_attribute = RATIO_AS_LFC_DIFFERENCE[tested_ratio]
+    lfc = _get_lfc_without_intron_axis(state_dict[numerator_attribute], intron_index)
+    if denominator_attribute is not None:
+        lfc = lfc - _get_lfc_without_intron_axis(state_dict[denominator_attribute], intron_index)
+    return lfc
+
+
+def get_hot_start_reduced_lfc(design_matrix: torch.Tensor,
+                              reduced_design_matrix: torch.Tensor,
+                              lfc_of_tested_ratio: torch.Tensor) -> torch.Tensor:
+    """
+    The reduced model's LFC that best reproduces the full model's term for the tested ratio.
+
+    Projected onto [1, reduced_design_matrix] rather than onto the reduced matrix alone. The model
+    carries its own intercepts, so what it can reproduce is the full model's term up to an additive
+    constant, and the reduced design is nested in the full one only once that constant is included
+    -- relevelling a categorical variable makes the raw column spaces genuinely non-nested. The
+    leftover constant is then moved into the intercepts by absorb_read_class_shifts.
+    """
+    target = (design_matrix @ lfc_of_tested_ratio).unsqueeze(1)
+    constant_column = reduced_design_matrix.new_ones(reduced_design_matrix.shape[0], 1)
+    reduced_matrix_with_constant = torch.cat([constant_column, reduced_design_matrix], dim=1)
+    solution = torch.linalg.lstsq(reduced_matrix_with_constant, target).solution
+    return solution[1:].squeeze(1)
+
+
+def absorb_read_class_shifts(model_reduced: nn.Module,
+                             model_full: nn.Module,
+                             design_matrix: torch.Tensor,
+                             reduced_design_matrix: torch.Tensor) -> None:
+    """
+    Move the reduced model's intercepts so that its predictions match the full model's as closely
+    as the reduced design allows. Modifies model_reduced in place.
+
+    Restricting a read class shifts its LFC term by a constant, which the intercepts can absorb
+    exactly: the exon class sits under intercept_exon alone, the nascent class under
+    intercept_unspliced + intercept_pi_logit, and the unspliced class under intercept_unspliced,
+    so shifting the unspliced class also needs intercept_pi_logit to keep the nascent class put.
+
+    The shift is measured rather than derived per tested ratio, which keeps one rule for all six.
+    Its mean over samples is the right constant to absorb: the hot start leaves a residual that is
+    orthogonal to the constant vector, so the mean is exactly the constant the projection dropped,
+    and when the two designs span the same space the residual vanishes and the reduced model starts
+    at the full model's loss.
+    """
+    with torch.no_grad():
+        full_terms = model_full.get_lfc_terms_per_read_class(design_matrix, None)
+        reduced_terms = model_reduced.get_lfc_terms_per_read_class(design_matrix,
+                                                                   reduced_design_matrix)
+        shift_exon, shift_nascent, shift_unspliced = (
+            (reduced - full).mean(dim=0) for reduced, full in zip(reduced_terms, full_terms))
+
+        model_reduced.intercept_exon -= shift_exon
+        model_reduced.intercept_unspliced -= shift_unspliced
+        model_reduced.intercept_pi_logit += shift_unspliced - shift_nascent
 
 
 def make_lbfgs_optimizer(model: nn.Module) -> optim.LBFGS:
@@ -319,17 +395,18 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
 
     fisher_information_matrix = get_fisher_information_matrix(model_full, rna_kinetics_loss_by_params)
     model_param_df = add_wald_test_results(model_param_df, fisher_information_matrix)
-    model_param_df = model_param_df.set_index(["parameter_type", "feature_name", "intron_name"], drop=False)
 
     test_results_list: list[dict] = []
     for _, lrt_metadata_row in dataset_metadata.lrt_metadata.iterrows():
         reduced_design_matrix = dataset_metadata.reduced_matrices[lrt_metadata_row['test_id']]
-        for tested_parameter in TestableParameters:
-            intron_names = gene_data.intron_names if intron_specific_lfc and tested_parameter in (
-                TestableParameters.BETA, TestableParameters.GAMMA) else [None]
-            for intron_name in intron_names:
+        for tested_ratio in TestedRatio:
+            # Every ratio except init/deg involves elongation or splicing, so it is tested one
+            # intron at a time whenever those LFCs are intron-specific.
+            tests_single_intron = intron_specific_lfc and tested_ratio != TestedRatio.INIT_OVER_DEG
+            tested_introns = gene_data.intron_names if tests_single_intron else [None]
+            for intron_name in tested_introns:
                 lrt_specification = LRTSpecification(num_features_reduced_matrix=reduced_design_matrix.shape[1],
-                                                     tested_parameter=tested_parameter,
+                                                     tested_ratio=tested_ratio,
                                                      tested_intron=intron_name)
 
                 model_reduced = RNAKineticsModel(feature_names=dataset_metadata.feature_names,
@@ -342,19 +419,17 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
                 for key, value in state_dict_model_full.items():
                     hot_start_state_dict[key] = value
 
+                intron_index = 0 if intron_name is None else gene_data.intron_names.index(intron_name)
+                lfc_of_tested_ratio = get_lfc_of_tested_ratio(
+                    state_dict_model_full, tested_ratio, intron_index)
+
                 if reduced_design_matrix.shape[1] > 0:
-                    tested_attribute = TESTED_PARAMETER_TO_ATTRIBUTE[lrt_specification.tested_parameter]
-                    if lrt_specification.tested_parameter == TestableParameters.ALPHA:
-                        lfc_full_model = state_dict_model_full[tested_attribute]
-                    else:
-                        intron_index = 0 if not model_full.intron_specific_lfc else model_full.intron_names.index(
-                            lrt_specification.tested_intron)
-                        lfc_full_model = state_dict_model_full[tested_attribute][:, intron_index]
-                    # Initialize LFC in reduced model via least squares
-                    hot_start_state_dict['reduced_lfc'] = torch.linalg.lstsq(reduced_design_matrix,
-                                                                             dataset_metadata.design_matrix @ lfc_full_model).solution
+                    hot_start_state_dict['reduced_lfc'] = get_hot_start_reduced_lfc(
+                        dataset_metadata.design_matrix, reduced_design_matrix, lfc_of_tested_ratio)
 
                 model_reduced.load_state_dict(hot_start_state_dict)
+                absorb_read_class_shifts(model_reduced, model_full,
+                                         dataset_metadata.design_matrix, reduced_design_matrix)
 
                 optimizer_reduced = make_lbfgs_optimizer(model_reduced)
                 closure_reduced, evaluate_loss_reduced = _make_rna_kinetics_closures(
@@ -366,7 +441,7 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
                 )
 
                 test_result = lrt_metadata_row.to_dict()
-                test_result['tested_parameter'] = lrt_specification.tested_parameter
+                test_result['tested_parameter'] = lrt_specification.tested_ratio
                 test_result['gene_name'] = gene_data.gene_name
                 test_result['intron_name'] = lrt_specification.tested_intron
 
@@ -374,13 +449,16 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
                 test_result[
                     'training_converged_within_max_epochs_reduced_model'] = training_results_reduced.converged_within_max_epochs
 
-                lfc_value_positive = 0 if pd.isna(test_result['lfc_column_positive']) else model_param_df.loc[
-                    (lrt_specification.tested_parameter, test_result['lfc_column_positive'],
-                     lrt_specification.tested_intron)]['value']
+                # Read off the tested ratio rather than the parameter table: three of the six
+                # ratios have no row of their own there.
+                feature_names = dataset_metadata.feature_names
+                def lfc_of_column(column_name) -> float:
+                    if pd.isna(column_name):
+                        return 0.0
+                    return lfc_of_tested_ratio[feature_names.index(column_name)].item()
 
-                lfc_value_negative = 0 if pd.isna(test_result['lfc_column_negative']) else model_param_df.loc[
-                    (lrt_specification.tested_parameter, test_result['lfc_column_negative'],
-                     lrt_specification.tested_intron)]['value']
+                lfc_value_positive = lfc_of_column(test_result['lfc_column_positive'])
+                lfc_value_negative = lfc_of_column(test_result['lfc_column_negative'])
 
                 test_result['lfc'] = lfc_value_positive - lfc_value_negative
                 test_result['loss_full_model'] = training_results_full.final_loss
@@ -416,9 +494,9 @@ def get_regularized_rna_kinetics_model_results(gene_data: GeneData,
     regularization_coefficients_splice_over_deg = torch.zeros((len(model_regularized.feature_names), 1)).to(device)
     for feature_index, feature_name in enumerate(model_regularized.feature_names):
         regularization_coefficients_elong_over_deg[feature_index] = regularization_coefficients_df.loc[
-            (PARAMETER_WIRE_NAMES['lfc_elong_over_deg'], feature_name)]['lambda']
+            (LFCParameter.ELONG_OVER_DEG, feature_name)]['lambda']
         regularization_coefficients_splice_over_deg[feature_index] = regularization_coefficients_df.loc[
-            (PARAMETER_WIRE_NAMES['lfc_splice_over_deg'], feature_name)]['lambda']
+            (LFCParameter.SPLICE_OVER_DEG, feature_name)]['lambda']
 
     optimizer_regularized = make_lbfgs_optimizer(model_regularized)
     closure_regularized, evaluate_loss_regularized = _make_rna_kinetics_closures(
@@ -514,15 +592,15 @@ def get_intron_coverage_model_results(
         )
 
         lfc_positive = 0.0 if pd.isna(lrt_row['lfc_column_positive']) else \
-            model_param_df.loc[(PARAMETER_WIRE_NAMES['lfc_elong_over_splice'],
+            model_param_df.loc[(LFCParameter.ELONG_OVER_SPLICE,
                                 lrt_row['lfc_column_positive'], lfc_intron_name)]['value']
         lfc_negative = 0.0 if pd.isna(lrt_row['lfc_column_negative']) else \
-            model_param_df.loc[(PARAMETER_WIRE_NAMES['lfc_elong_over_splice'],
+            model_param_df.loc[(LFCParameter.ELONG_OVER_SPLICE,
                                 lrt_row['lfc_column_negative'], lfc_intron_name)]['value']
 
         chi2_stat = 2 * (results_reduced.final_loss - results_full.final_loss)
         test_result = lrt_row.to_dict()
-        test_result['tested_parameter'] = PARAMETER_WIRE_NAMES['lfc_elong_over_splice']
+        test_result['tested_parameter'] = LFCParameter.ELONG_OVER_SPLICE
         test_result['intron_name'] = lfc_intron_name
         test_result['lfc'] = lfc_positive - lfc_negative
         test_result['loss_full_model'] = results_full.final_loss
@@ -623,7 +701,7 @@ def get_global_rna_kinetics_model_results(
 
     model, training_results = _train_two_stage(
         model,
-        global_param_names={'lfc_elong_over_deg', 'lfc_splice_over_deg'},
+        global_param_names={LFCParameter.ELONG_OVER_DEG, LFCParameter.SPLICE_OVER_DEG},
         make_closures=lambda opt: _make_global_rna_kinetics_closures(model, opt, global_gene_data, dataset_metadata),
         label='Global RNA kinetics | full model',
         verbose=verbose,
@@ -639,10 +717,10 @@ def get_global_rna_kinetics_model_results(
     for _, lrt_row in dataset_metadata.lrt_metadata.iterrows():
         reduced_matrix = dataset_metadata.reduced_matrices[lrt_row['test_id']].to(device)
 
-        for tested_parameter in (TestableParameters.BETA, TestableParameters.GAMMA):
+        for tested_ratio in GLOBAL_MODEL_TESTED_RATIOS:
             lrt_spec = LRTSpecification(
                 num_features_reduced_matrix=reduced_matrix.shape[1],
-                tested_parameter=tested_parameter,
+                tested_ratio=tested_ratio,
             )
             model_reduced = GlobalRNAKineticsModel(
                 feature_names=feature_names,
@@ -657,34 +735,38 @@ def get_global_rna_kinetics_model_results(
             for key in full_state:
                 reduced_state[key] = full_state[key]
 
+            lfc_of_tested_ratio = get_lfc_of_tested_ratio(full_state, tested_ratio)
+
             if reduced_matrix.shape[1] > 0:
-                full_lfc = model.lfc_elong_over_deg if tested_parameter == TestableParameters.BETA else model.lfc_splice_over_deg
-                full_contribution = dataset_metadata.design_matrix @ full_lfc.detach()
-                reduced_state['reduced_lfc'] = torch.linalg.lstsq(reduced_matrix, full_contribution).solution
+                reduced_state['reduced_lfc'] = get_hot_start_reduced_lfc(
+                    dataset_metadata.design_matrix, reduced_matrix, lfc_of_tested_ratio)
 
             model_reduced.load_state_dict(reduced_state)
+            absorb_read_class_shifts(model_reduced, model,
+                                     dataset_metadata.design_matrix, reduced_matrix)
 
             model_reduced, results_reduced = _train_two_stage(
                 model_reduced,
-                global_param_names={'lfc_elong_over_deg', 'lfc_splice_over_deg', 'reduced_lfc'},
+                global_param_names={LFCParameter.ELONG_OVER_DEG, LFCParameter.SPLICE_OVER_DEG,
+                                    'reduced_lfc'},
                 make_closures=lambda opt: _make_global_rna_kinetics_closures(
                     model_reduced, opt, global_gene_data, dataset_metadata, reduced_matrix,
                 ),
-                label=f'Global RNA kinetics | LRT {lrt_row["test_id"]} | {tested_parameter}',
+                label=f'Global RNA kinetics | LRT {lrt_row["test_id"]} | {tested_ratio}',
                 verbose=verbose,
             )
 
-            full_lfc_vals = (model.lfc_elong_over_deg.detach()
-                             if tested_parameter == TestableParameters.BETA
-                             else model.lfc_splice_over_deg.detach())
-            lfc_positive = (0.0 if pd.isna(lrt_row['lfc_column_positive'])
-                            else full_lfc_vals[feature_names.index(lrt_row['lfc_column_positive'])].item())
-            lfc_negative = (0.0 if pd.isna(lrt_row['lfc_column_negative'])
-                            else full_lfc_vals[feature_names.index(lrt_row['lfc_column_negative'])].item())
+            def lfc_of_column(column_name) -> float:
+                if pd.isna(column_name):
+                    return 0.0
+                return lfc_of_tested_ratio[feature_names.index(column_name)].item()
+
+            lfc_positive = lfc_of_column(lrt_row['lfc_column_positive'])
+            lfc_negative = lfc_of_column(lrt_row['lfc_column_negative'])
 
             chi2_stat = 2 * (results_reduced.final_loss - training_results.final_loss)
             test_result = lrt_row.to_dict()
-            test_result['tested_parameter'] = tested_parameter
+            test_result['tested_parameter'] = tested_ratio
             test_result['lfc'] = lfc_positive - lfc_negative
             test_result['loss_full_model'] = training_results.final_loss
             test_result['loss_reduced_model'] = results_reduced.final_loss
@@ -718,7 +800,7 @@ def get_global_intron_coverage_model_results(
 
     model_full, results_full = _train_two_stage(
         model_full,
-        global_param_names={'lfc_elong_over_splice'},
+        global_param_names={LFCParameter.ELONG_OVER_SPLICE},
         make_closures=lambda opt: _make_intron_coverage_closures(model_full, opt, coverage, dataset_metadata.design_matrix),
         label='Global intron coverage | full model',
         verbose=verbose,
@@ -751,20 +833,22 @@ def get_global_intron_coverage_model_results(
 
         model_reduced, results_reduced = _train_two_stage(
             model_reduced,
-            global_param_names={'lfc_elong_over_splice'},
+            global_param_names={LFCParameter.ELONG_OVER_SPLICE},
             make_closures=lambda opt: _make_intron_coverage_closures(model_reduced, opt, coverage, reduced_matrix),
             label=f'Global intron coverage | LRT {lrt_row["test_id"]}',
             verbose=verbose,
         )
 
         lfc_positive = 0.0 if pd.isna(lrt_row['lfc_column_positive']) else \
-            model_param_df.loc[(PARAMETER_WIRE_NAMES['lfc_elong_over_splice'], lrt_row['lfc_column_positive'], None)]['value']
+            model_param_df.loc[(LFCParameter.ELONG_OVER_SPLICE,
+                                lrt_row['lfc_column_positive'], None)]['value']
         lfc_negative = 0.0 if pd.isna(lrt_row['lfc_column_negative']) else \
-            model_param_df.loc[(PARAMETER_WIRE_NAMES['lfc_elong_over_splice'], lrt_row['lfc_column_negative'], None)]['value']
+            model_param_df.loc[(LFCParameter.ELONG_OVER_SPLICE,
+                                lrt_row['lfc_column_negative'], None)]['value']
 
         chi2_stat = 2 * (results_reduced.final_loss - results_full.final_loss)
         test_result = lrt_row.to_dict()
-        test_result['tested_parameter'] = PARAMETER_WIRE_NAMES['lfc_elong_over_splice']
+        test_result['tested_parameter'] = LFCParameter.ELONG_OVER_SPLICE
         test_result['intron_name'] = None
         test_result['lfc'] = lfc_positive - lfc_negative
         test_result['loss_full_model'] = results_full.final_loss
@@ -802,7 +886,7 @@ def get_regularized_intron_coverage_model_results(
     regularization_coefficients_elong_over_splice = torch.zeros((len(dataset_metadata.feature_names), 1)).to(device)
     for feature_index, feature_name in enumerate(dataset_metadata.feature_names):
         regularization_coefficients_elong_over_splice[feature_index] = regularization_coefficients_df.loc[
-            (PARAMETER_WIRE_NAMES['lfc_elong_over_splice'], feature_name)]['lambda']
+            (LFCParameter.ELONG_OVER_SPLICE, feature_name)]['lambda']
 
     optimizer_regularized = make_lbfgs_optimizer(model_regularized)
     closure_regularized, evaluate_loss_regularized = _make_intron_coverage_closures(

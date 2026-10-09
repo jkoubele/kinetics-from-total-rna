@@ -93,6 +93,37 @@ def concat_gene_data_list(gene_data_list: list[GeneData]) -> GlobalGeneData:
     )
 
 
+def _validate_reduced_matrix(design_matrix: np.ndarray,
+                             reduced_matrix: np.ndarray,
+                             expected_lrt_df: int,
+                             test_id: str) -> None:
+    """
+    Check that the reduced design is a proper nested submodel of the full one, with the degrees
+    of freedom R reported.
+
+    The constant column belongs in both spans: the models carry their own intercepts, so what the
+    likelihood can distinguish is each design's contribution up to an additive constant. Without
+    it the check would reject valid reduced matrices, since the categorical branch of
+    create_design_matrices.R relevels the factor before dropping a column, which leaves the raw
+    column spaces non-nested.
+    """
+    constant = np.ones((design_matrix.shape[0], 1))
+    rank_full = np.linalg.matrix_rank(np.hstack([constant, design_matrix]))
+    rank_reduced = np.linalg.matrix_rank(np.hstack([constant, reduced_matrix]))
+    rank_combined = np.linalg.matrix_rank(np.hstack([constant, design_matrix, reduced_matrix]))
+
+    if rank_combined != rank_full:
+        raise ValueError(
+            f"Reduced matrix for {test_id} is not nested in the full design: adding its columns "
+            f"raises the rank from {rank_full} to {rank_combined}, so the LRT "
+            f"would not compare nested models.")
+    if rank_full - rank_reduced != expected_lrt_df:
+        raise ValueError(
+            f"Reduced matrix for {test_id} drops {rank_full - rank_reduced} degrees of freedom, "
+            f"but lrt_metadata reports lrt_df={expected_lrt_df}. The p-values would use the wrong "
+            f"null distribution.")
+
+
 def load_dataset_metadata(design_matrix_file: Path,
                           library_size_factors_file: Path,
                           lrt_metadata_file: Path,
@@ -109,7 +140,7 @@ def load_dataset_metadata(design_matrix_file: Path,
                                  dtype=torch.float32)
     design_matrix_df = design_matrix_df.set_index('sample')
 
-    lrt_metadata = pd.read_csv(lrt_metadata_file, sep='\t')
+    lrt_metadata = pd.read_csv(lrt_metadata_file, sep='\t').set_index('test_id', drop=False)
     reduced_matrices: dict[str, torch.Tensor] = {}
     for test_id in lrt_metadata['test_id']:
         reduced_matrix_df = pd.read_csv(reduced_matrices_folder / f"{test_id}.tsv", sep='\t',
@@ -117,6 +148,8 @@ def load_dataset_metadata(design_matrix_file: Path,
         if not all(design_matrix_df.index == reduced_matrix_df.index):
             raise ValueError(
                 f"Reduced matrix index {reduced_matrix_df.index} does not equal to design matrix index {design_matrix_df.index}.")
+        _validate_reduced_matrix(design_matrix_df.values, reduced_matrix_df.values,
+                                 int(lrt_metadata.loc[test_id, 'lrt_df']), test_id)
         reduced_matrices[test_id] = torch.tensor(reduced_matrix_df.values, dtype=torch.float32)
 
     dataset_metadata = DatasetMetadata(design_matrix=torch.tensor(design_matrix_df.values, dtype=torch.float32),
