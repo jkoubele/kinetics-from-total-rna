@@ -34,10 +34,6 @@ class CacheForRegularization:
     dataset_metadata: DatasetMetadata
     intron_specific_lfc: Optional[bool] = None  # RNAKineticsModel only: LFC parameter shape
 
-    # IntronCoverageModel only: whether its single LFC belongs to one named intron rather than
-    # being shared across a gene's introns. Not an architecture flag -- it only affects labelling.
-    lfc_is_intron_specific: bool = False
-
 
 def _get_lfc_without_intron_axis(lfc: torch.Tensor, intron_index: int) -> torch.Tensor:
     """One LFC parameter as a (num_features,) vector, dropping the intron axis where it has one."""
@@ -71,17 +67,23 @@ def get_hot_start_reduced_lfc(design_matrix: torch.Tensor,
     """
     The reduced model's LFC that best reproduces the full model's term for the tested ratio.
 
+    Shaped like lfc_of_tested_ratio, which is (num_features,) for the rna_kinetics models and
+    (num_features, num_introns) for the coverage models.
+
     Projected onto [1, reduced_design_matrix] rather than onto the reduced matrix alone. The model
     carries its own intercepts, so what it can reproduce is the full model's term up to an additive
     constant, and the reduced design is nested in the full one only once that constant is included
     -- relevelling a categorical variable makes the raw column spaces genuinely non-nested. The
     leftover constant is then moved into the intercepts by absorb_read_class_shifts.
     """
-    target = (design_matrix @ lfc_of_tested_ratio).unsqueeze(1)
+    is_one_dimensional = lfc_of_tested_ratio.dim() == 1
+    target = design_matrix @ (lfc_of_tested_ratio.unsqueeze(1) if is_one_dimensional
+                              else lfc_of_tested_ratio)
     constant_column = reduced_design_matrix.new_ones(reduced_design_matrix.shape[0], 1)
     reduced_matrix_with_constant = torch.cat([constant_column, reduced_design_matrix], dim=1)
     solution = torch.linalg.lstsq(reduced_matrix_with_constant, target).solution
-    return solution[1:].squeeze(1)
+    reduced_lfc = solution[1:]
+    return reduced_lfc.squeeze(1) if is_one_dimensional else reduced_lfc
 
 
 def absorb_read_class_shifts(model_reduced: nn.Module,
@@ -113,6 +115,25 @@ def absorb_read_class_shifts(model_reduced: nn.Module,
         model_reduced.intercept_exon -= shift_exon
         model_reduced.intercept_unspliced -= shift_unspliced
         model_reduced.intercept_pi_logit += shift_unspliced - shift_nascent
+
+
+def absorb_coverage_model_shift(model_reduced: IntronCoverageModel,
+                                model_full: IntronCoverageModel,
+                                design_matrix: torch.Tensor,
+                                reduced_design_matrix: torch.Tensor) -> None:
+    """
+    Move the reduced coverage model's intercept so its predicted pi matches the full model's as
+    closely as the reduced design allows. Modifies model_reduced in place.
+
+    The counterpart of absorb_read_class_shifts for the coverage-only models, which predict
+    pi = sigmoid(intercept_pi_logit - X @ lfc_elong_over_splice) and so have a single LFC term
+    under a single intercept. The term enters negatively, so the intercept takes the shift with
+    the same sign.
+    """
+    with torch.no_grad():
+        shift = ((reduced_design_matrix @ model_reduced.lfc_elong_over_splice)
+                 - (design_matrix @ model_full.lfc_elong_over_splice)).mean(dim=0)
+        model_reduced.intercept_pi_logit += shift
 
 
 def make_lbfgs_optimizer(model: nn.Module) -> optim.LBFGS:
@@ -524,18 +545,16 @@ def get_intron_coverage_model_results(
         device: str = 'cpu',
         verbose: bool = False,
         compute_wald_test: bool = True,
-        lfc_is_intron_specific: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, StateDict]:
     coverage = coverage.to(device)
     dataset_metadata = dataset_metadata.to(device)
 
-    # The intron the LFC is reported under; None when it is shared across the gene's introns.
-    lfc_intron_name = intron_names[0] if lfc_is_intron_specific else None
+    # The intron the LFC is reported under; None when it is shared across several introns.
+    lfc_intron_name = intron_names[0] if len(intron_names) == 1 else None
 
     model_full = IntronCoverageModel(
         feature_names=dataset_metadata.feature_names,
         intron_names=intron_names,
-        lfc_is_intron_specific=lfc_is_intron_specific,
     ).to(device)
     model_full.initialize_parameters(coverage)
 
@@ -571,16 +590,16 @@ def get_intron_coverage_model_results(
         model_reduced = IntronCoverageModel(
             feature_names=placeholder_names,
             intron_names=intron_names,
-            lfc_is_intron_specific=lfc_is_intron_specific,
         ).to(device)
 
         with torch.no_grad():
             model_reduced.intercept_pi_logit.data.copy_(model_full.intercept_pi_logit.data)
             if num_reduced_features > 0:
-                full_lfc_contribution = dataset_metadata.design_matrix @ model_full.lfc_elong_over_splice
-                model_reduced.lfc_elong_over_splice.data.copy_(
-                    torch.linalg.lstsq(reduced_matrix, full_lfc_contribution).solution
-                )
+                model_reduced.lfc_elong_over_splice.data.copy_(get_hot_start_reduced_lfc(
+                    dataset_metadata.design_matrix, reduced_matrix,
+                    model_full.lfc_elong_over_splice.detach()))
+        absorb_coverage_model_shift(model_reduced, model_full,
+                                    dataset_metadata.design_matrix, reduced_matrix)
 
         optimizer_reduced = make_lbfgs_optimizer(model_reduced)
         closure_reduced, evaluate_loss_reduced = _make_intron_coverage_closures(
@@ -826,10 +845,11 @@ def get_global_intron_coverage_model_results(
         with torch.no_grad():
             model_reduced.intercept_pi_logit.data.copy_(model_full.intercept_pi_logit.data)
             if num_reduced_features > 0:
-                full_lfc_contribution = dataset_metadata.design_matrix @ model_full.lfc_elong_over_splice
-                model_reduced.lfc_elong_over_splice.data.copy_(
-                    torch.linalg.lstsq(reduced_matrix, full_lfc_contribution).solution
-                )
+                model_reduced.lfc_elong_over_splice.data.copy_(get_hot_start_reduced_lfc(
+                    dataset_metadata.design_matrix, reduced_matrix,
+                    model_full.lfc_elong_over_splice.detach()))
+        absorb_coverage_model_shift(model_reduced, model_full,
+                                    dataset_metadata.design_matrix, reduced_matrix)
 
         model_reduced, results_reduced = _train_two_stage(
             model_reduced,
@@ -870,7 +890,6 @@ def get_regularized_intron_coverage_model_results(
         hot_start_state_dict: StateDict,
         regularization_coefficients_df: pd.DataFrame,
         device: str = 'cpu',
-        lfc_is_intron_specific: bool = False,
 ) -> pd.DataFrame:
     coverage = input_data.coverage.to(device)
     dataset_metadata = dataset_metadata.to(device)
@@ -879,7 +898,6 @@ def get_regularized_intron_coverage_model_results(
     model_regularized = IntronCoverageModel(
         feature_names=dataset_metadata.feature_names,
         intron_names=input_data.intron_names,
-        lfc_is_intron_specific=lfc_is_intron_specific,
     ).to(device)
     model_regularized.load_state_dict(hot_start_state_dict)
 

@@ -47,7 +47,6 @@ if __name__ == "__main__":
             coverage=intron_data.coverage,
             dataset_metadata=dataset_metadata,
             intron_names=intron_data.intron_names,
-            lfc_is_intron_specific=True,
         )
         model_param_df = model_param_df.reset_index(drop=True)
         model_param_df['gene_name'] = intron_data.gene_name
@@ -67,7 +66,6 @@ if __name__ == "__main__":
     cache_for_regularization = CacheForRegularization(
         training_input_per_gene=training_inputs,
         dataset_metadata=dataset_metadata,
-        lfc_is_intron_specific=True,
     )
     torch.save(cache_for_regularization,
                args.output_folder / f'cache_for_regularization{args.output_name_suffix}.pt')

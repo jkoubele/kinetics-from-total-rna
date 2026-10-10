@@ -47,7 +47,6 @@ if __name__ == "__main__":
             hot_start_state_dict=model_state_dict,
             regularization_coefficients_df=regularization_coefficients_df,
             device=device,
-            lfc_is_intron_specific=cache_for_regularization.lfc_is_intron_specific,
         )
         regularized_model_params_list.append(model_param_df)
 

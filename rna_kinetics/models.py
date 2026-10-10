@@ -428,8 +428,7 @@ class IntronCoverageModel(nn.Module):
 
     def __init__(self,
                  feature_names: list[str],
-                 intron_names: list[str],
-                 lfc_is_intron_specific: bool = False):
+                 intron_names: list[str]):
         super().__init__()
         self.feature_names = feature_names
         self.intron_names = intron_names
@@ -437,14 +436,10 @@ class IntronCoverageModel(nn.Module):
         num_features = len(feature_names)
         num_introns = len(intron_names)
 
-        # The model always has a single LFC, shared across whatever introns it was given.
-        # When it is fitted to one intron at a time, that LFC belongs to that intron and is
-        # reported under its name; when fitted per gene, it is shared and reported unnamed.
-        if lfc_is_intron_specific and num_introns != 1:
-            raise ValueError(
-                f"lfc_is_intron_specific requires exactly one intron, got {num_introns}: {intron_names}.")
-        self.lfc_is_intron_specific = lfc_is_intron_specific
-
+        # One LFC, shared across whatever introns the model was given. The second axis is a
+        # singleton so that the term broadcasts against the per-intron intercept; it is never an
+        # intron axis. Fitting this model per intron means constructing it with that one intron,
+        # and then its LFC is reported under that intron's name -- see get_param_df.
         self.lfc_elong_over_splice = nn.Parameter(torch.zeros(num_features, 1))
         self.intercept_pi_logit = nn.Parameter(torch.zeros(num_introns))
 
@@ -461,8 +456,11 @@ class IntronCoverageModel(nn.Module):
         return pi
 
     def get_param_df(self) -> pd.DataFrame:
+        # Given a single intron, the shared LFC is that intron's LFC, so it is reported under its
+        # name. Given several, it is shared across them and reported unnamed.
+        lfc_intron_axis = 'intron' if len(self.intron_names) == 1 else None
         return build_param_df(self, {
-            'lfc_elong_over_splice': ('feature', 'intron' if self.lfc_is_intron_specific else None),
+            'lfc_elong_over_splice': ('feature', lfc_intron_axis),
             'intercept_pi_logit': ('intron',),
         })
 
