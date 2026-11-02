@@ -70,7 +70,7 @@ process GetModeledGenes {
 }
 
 
-process FitModel {
+process FitRNAKineticsModel {
     input:
     tuple (
         path(modeled_genes_chunk),
@@ -98,7 +98,7 @@ process FitModel {
     script:
     """
     export PYTHONPATH='${baseDir}'\${PYTHONPATH:+:\$PYTHONPATH}
-    fit_model.py \
+    fit_rna_kinetics_model.py \
     --modeled_genes $modeled_genes_chunk \
     --modeled_introns $modeled_introns \
     --design_matrix $design_matrix \
@@ -116,7 +116,7 @@ process FitModel {
 
 }
 
-process FitGeneIntronCoverageModel {
+process FitGeneSpecificIntronCoverageModel {
     input:
     tuple(
         path(modeled_genes_chunk),
@@ -157,7 +157,7 @@ process FitGeneIntronCoverageModel {
     """
 }
 
-process FitIntronCoverageModel {
+process FitIntronSpecificIntronCoverageModel {
     input:
     tuple(
         path(modeled_introns),
@@ -221,7 +221,7 @@ process FitGlobalIntronCoverageModel {
     """
 }
 
-process FitGlobalRnaKineticsModel {
+process FitGlobalRNAKineticsModel {
     publishDir "${params.outdir}/modeling/${params.model_run_id}/global_rna_kinetics_model", mode: 'copy'
 
     input:
@@ -306,7 +306,7 @@ process EstimatePriorVariance {
     """
 }
 
-process FitRegularizedModel {
+process FitRegularizedRNAKineticsModel {
     input:
     tuple(
         path(cache_for_regularization),
@@ -323,7 +323,7 @@ process FitRegularizedModel {
     script:
     """
     export PYTHONPATH='${baseDir}'\${PYTHONPATH:+:\$PYTHONPATH}
-    fit_regularized_model.py \
+    fit_regularized_rna_kinetics_model.py \
     --cache_for_regularization $cache_for_regularization \
     --regularization_coefficients $regularization_coefficients \
     --output_name_suffix _$chunk_name
@@ -416,7 +416,7 @@ process PostprocessGlobalResultsAndPlot {
     """
 }
 
-workflow rna_kinetics_model_subworkflow {
+workflow gene_specific_rna_kinetics_model_subworkflow {
     take:
         gene_names_chunks
         modeled_introns
@@ -447,26 +447,26 @@ workflow rna_kinetics_model_subworkflow {
             .combine(coverage_files.map { file_list -> tuple([file_list]) })
             .map { it + [false] }
 
-        def fit_model_output = FitModel(model_input)
+        def fit_output = FitRNAKineticsModel(model_input)
 
         def model_result_merged = MergeModelResultChunks(
-            fit_model_output.model_parameters_chunk.collect(),
-            fit_model_output.ratio_lfcs_chunk.collect(),
-            fit_model_output.test_results_chunk.collect(),
+            fit_output.model_parameters_chunk.collect(),
+            fit_output.ratio_lfcs_chunk.collect(),
+            fit_output.test_results_chunk.collect(),
             model_subfolder
         )
 
         def prior_variance_out = EstimatePriorVariance(model_result_merged.ratio_lfcs, model_subfolder)
 
-        def fit_regularized_model_output = FitRegularizedModel(
-            fit_model_output.cache_for_regularization
+        def fit_regularized_output = FitRegularizedRNAKineticsModel(
+            fit_output.cache_for_regularization
                 .combine(prior_variance_out.regularization_coefficients)
         )
 
         def merge_regularization_output = MergeRegularization(
             model_result_merged.test_results_before_regularization,
-            fit_regularized_model_output.regularized_model_parameters_chunk.collect(),
-            fit_regularized_model_output.regularized_ratio_lfcs_chunk.collect(),
+            fit_regularized_output.regularized_model_parameters_chunk.collect(),
+            fit_regularized_output.regularized_ratio_lfcs_chunk.collect(),
             model_subfolder
         )
 
@@ -505,26 +505,26 @@ workflow intron_specific_rna_kinetics_model_subworkflow {
             .combine(coverage_files.map { file_list -> tuple([file_list]) })
             .map { it + [true] }
 
-        def fit_model_output = FitModel(model_input)
+        def fit_output = FitRNAKineticsModel(model_input)
 
         def model_result_merged = MergeModelResultChunks(
-            fit_model_output.model_parameters_chunk.collect(),
-            fit_model_output.ratio_lfcs_chunk.collect(),
-            fit_model_output.test_results_chunk.collect(),
+            fit_output.model_parameters_chunk.collect(),
+            fit_output.ratio_lfcs_chunk.collect(),
+            fit_output.test_results_chunk.collect(),
             model_subfolder
         )
 
         def prior_variance_out = EstimatePriorVariance(model_result_merged.ratio_lfcs, model_subfolder)
 
-        def fit_regularized_model_output = FitRegularizedModel(
-            fit_model_output.cache_for_regularization
+        def fit_regularized_output = FitRegularizedRNAKineticsModel(
+            fit_output.cache_for_regularization
                 .combine(prior_variance_out.regularization_coefficients)
         )
 
         def merge_regularization_output = MergeRegularization(
             model_result_merged.test_results_before_regularization,
-            fit_regularized_model_output.regularized_model_parameters_chunk.collect(),
-            fit_regularized_model_output.regularized_ratio_lfcs_chunk.collect(),
+            fit_regularized_output.regularized_model_parameters_chunk.collect(),
+            fit_regularized_output.regularized_ratio_lfcs_chunk.collect(),
             model_subfolder
         )
 
@@ -562,26 +562,26 @@ workflow gene_specific_intron_coverage_model_subworkflow {
             // Wrapping coverage_files in an extra list prevents unwanted flattening behavior in .combine()
             .combine(coverage_files.map { file_list -> tuple([file_list]) })
 
-        def fit_model_output = FitGeneIntronCoverageModel(model_input)
+        def fit_output = FitGeneSpecificIntronCoverageModel(model_input)
 
         def model_result_merged = MergeModelResultChunks(
-            fit_model_output.model_parameters_chunk.collect(),
-            fit_model_output.ratio_lfcs_chunk.collect(),
-            fit_model_output.test_results_chunk.collect(),
+            fit_output.model_parameters_chunk.collect(),
+            fit_output.ratio_lfcs_chunk.collect(),
+            fit_output.test_results_chunk.collect(),
             model_subfolder
         )
 
         def prior_variance_out = EstimatePriorVariance(model_result_merged.ratio_lfcs, model_subfolder)
 
-        def fit_regularized_model_output = FitRegularizedIntronCoverageModel(
-            fit_model_output.cache_for_regularization
+        def fit_regularized_output = FitRegularizedIntronCoverageModel(
+            fit_output.cache_for_regularization
                 .combine(prior_variance_out.regularization_coefficients)
         )
 
         def merge_regularization_output = MergeRegularization(
             model_result_merged.test_results_before_regularization,
-            fit_regularized_model_output.regularized_model_parameters_chunk.collect(),
-            fit_regularized_model_output.regularized_ratio_lfcs_chunk.collect(),
+            fit_regularized_output.regularized_model_parameters_chunk.collect(),
+            fit_regularized_output.regularized_ratio_lfcs_chunk.collect(),
             model_subfolder
         )
 
@@ -611,26 +611,26 @@ workflow intron_specific_intron_coverage_model_subworkflow {
             // Wrapping coverage_files in an extra list prevents unwanted flattening behavior in .combine()
             .combine(coverage_files.map { file_list -> tuple([file_list]) })
 
-        def fit_model_output = FitIntronCoverageModel(model_input)
+        def fit_output = FitIntronSpecificIntronCoverageModel(model_input)
 
         def model_result_merged = MergeModelResultChunks(
-            fit_model_output.model_parameters_chunk.collect(),
-            fit_model_output.ratio_lfcs_chunk.collect(),
-            fit_model_output.test_results_chunk.collect(),
+            fit_output.model_parameters_chunk.collect(),
+            fit_output.ratio_lfcs_chunk.collect(),
+            fit_output.test_results_chunk.collect(),
             model_subfolder
         )
 
         def prior_variance_out = EstimatePriorVariance(model_result_merged.ratio_lfcs, model_subfolder)
 
-        def fit_regularized_model_output = FitRegularizedIntronCoverageModel(
-            fit_model_output.cache_for_regularization
+        def fit_regularized_output = FitRegularizedIntronCoverageModel(
+            fit_output.cache_for_regularization
                 .combine(prior_variance_out.regularization_coefficients)
         )
 
         def merge_regularization_output = MergeRegularization(
             model_result_merged.test_results_before_regularization,
-            fit_regularized_model_output.regularized_model_parameters_chunk.collect(),
-            fit_regularized_model_output.regularized_ratio_lfcs_chunk.collect(),
+            fit_regularized_output.regularized_model_parameters_chunk.collect(),
+            fit_regularized_output.regularized_ratio_lfcs_chunk.collect(),
             model_subfolder
         )
 
@@ -680,7 +680,7 @@ workflow global_rna_kinetics_model_subworkflow {
     main:
         def model_subfolder = 'global_rna_kinetics_model'
 
-        def fit_output = FitGlobalRnaKineticsModel(
+        def fit_output = FitGlobalRNAKineticsModel(
             modeled_genes
                 .combine(modeled_introns)
                 .combine(design_matrix)
@@ -767,7 +767,7 @@ workflow modeling_workflow {
         )
 
         if (fit_rna_kinetics_model) {
-            rna_kinetics_model_subworkflow(
+            gene_specific_rna_kinetics_model_subworkflow(
                 modeled_genes.gene_names_chunks,
                 modeled_genes.modeled_introns,
                 design_matrices_data.design_matrix,
