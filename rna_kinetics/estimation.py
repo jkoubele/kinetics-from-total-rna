@@ -11,8 +11,8 @@ from torch.func import functional_call, hessian
 
 from rna_kinetics.data import GeneData, IntronData, DatasetMetadata, GlobalGeneData
 from rna_kinetics.models import RNAKineticsLoss, RNAKineticsModel, TestedRatio, LRTSpecification, \
-    IntronCoverageModel, CoverageLoss, GlobalRNAKineticsModel, RATIO_AS_LFC_DIFFERENCE, \
-    GLOBAL_MODEL_TESTED_RATIOS, LFCParameter
+    IntronCoverageModel, CoverageLoss, GlobalRNAKineticsModel, RATIO_AS_LFC_COMBINATION, \
+    GLOBAL_MODEL_TESTED_RATIOS, LFCCombination, LFCParameter
 
 LOSS_CLAMP_VALUE = 1e30
 
@@ -83,24 +83,22 @@ def _get_lfc_without_intron_axis(lfc: torch.Tensor, intron_index: int) -> torch.
     return lfc if lfc.dim() == 1 else lfc[:, intron_index]
 
 
-def get_lfc_of_lfc_difference(state_dict: StateDict,
-                              ratio_as_lfc_difference: tuple[str, Optional[str]],
-                              intron_index: int = 0) -> torch.Tensor:
+def get_lfc_of_lfc_combination(state_dict: StateDict,
+                               lfc_combination: LFCCombination,
+                               intron_index: int = 0) -> torch.Tensor:
     """
     The fitted LFC of one rate ratio, as a (num_features,) vector.
 
-    The ratio arrives already decomposed into one or two LFC parameters, which is what lets the
-    intron coverage model use this as well: its single LFC is a ratio in its own right and has no
-    entry in `RATIO_AS_LFC_DIFFERENCE`.
+    The ratio arrives already decomposed into (parameter, coefficient) pairs, which is what lets
+    the intron coverage model use this as well: its single LFC is a ratio in its own right and has
+    no entry in `RATIO_AS_LFC_COMBINATION`.
 
     The elongation and splicing LFCs may carry an intron axis, in which case the given intron's
     column is taken; initiation never does.
     """
-    numerator_attribute, denominator_attribute = ratio_as_lfc_difference
-    lfc = _get_lfc_without_intron_axis(state_dict[numerator_attribute], intron_index)
-    if denominator_attribute is not None:
-        lfc = lfc - _get_lfc_without_intron_axis(state_dict[denominator_attribute], intron_index)
-    return lfc
+    terms = [coefficient * _get_lfc_without_intron_axis(state_dict[attribute], intron_index)
+             for attribute, coefficient in lfc_combination]
+    return torch.stack(terms).sum(dim=0)
 
 
 def get_lfc_of_tested_ratio(state_dict: StateDict,
@@ -109,14 +107,14 @@ def get_lfc_of_tested_ratio(state_dict: StateDict,
     """
     The fitted LFC of the rate ratio under test, as a (num_features,) vector.
 
-    Three of the six ratios are single parameters; the other three are a difference of two, which
-    is well defined because both are measured against degradation and that term cancels.
+    Three of the six ratios are single parameters; the other three combine two or three of them,
+    which is well defined because the parametrized three span all six.
 
     Used both to hot start the reduced model and to report the tested ratio's effect size, neither
     of which can read a single parameter for the three unparametrized ratios.
     """
-    return get_lfc_of_lfc_difference(state_dict, RATIO_AS_LFC_DIFFERENCE[tested_ratio],
-                                     intron_index)
+    return get_lfc_of_lfc_combination(state_dict, RATIO_AS_LFC_COMBINATION[tested_ratio],
+                                      intron_index)
 
 
 def get_lfc_of_column(lfc_of_tested_ratio: torch.Tensor,
@@ -303,11 +301,11 @@ def set_full_rna_kinetics_model_from_reduced(model_full: nn.Module,
     the full model nests the reduced one, so the reduced solution is reachable and the full fit had
     simply stopped somewhere worse.
 
-    Needs no per-ratio knowledge. The reduced model's three read-class terms are
-    exon = X alpha, nascent = X(alpha - beta) and unspliced = X(alpha - gamma), so projecting each
-    onto the full design recovers all three parameters, whichever ratio was restricted. The
-    projection is exact because the reduced design is nested in [1, X], and whatever constant it
-    drops is then absorbed by the intercepts.
+    Needs no per-ratio knowledge. The reduced model's three read-class terms are the same linear
+    combinations of the parameters as the full model's (see `get_lfc_terms_per_read_class`), so
+    projecting each onto the full design recovers all three parameters, whichever ratio was
+    restricted. The projection is exact because the reduced design is nested in [1, X], and
+    whatever constant it drops is then absorbed by the intercepts.
     """
     _copy_shared_parameters(model_full, model_reduced)
     with torch.no_grad():
@@ -316,10 +314,10 @@ def set_full_rna_kinetics_model_from_reduced(model_full: nn.Module,
         lfc_init_over_deg = get_projection_onto_design(design_matrix, exon_term)
         init_over_deg_per_intron = lfc_init_over_deg.unsqueeze(1)
         model_full.lfc_init_over_deg.copy_(lfc_init_over_deg)
-        model_full.lfc_elong_over_deg.copy_(
-            init_over_deg_per_intron - get_projection_onto_design(design_matrix, nascent_term))
         model_full.lfc_splice_over_deg.copy_(
             init_over_deg_per_intron - get_projection_onto_design(design_matrix, unspliced_term))
+        model_full.lfc_elong_over_splice.copy_(
+            get_projection_onto_design(design_matrix, unspliced_term - nascent_term))
     absorb_read_class_shifts(model_full, model_reduced, design_matrix, reduced_design_matrix)
 
 
@@ -332,18 +330,18 @@ def set_full_global_rna_kinetics_model_from_reduced(model_full: nn.Module,
 
     lfc_init_over_deg is per gene here and no tested ratio involves initiation
     (GLOBAL_MODEL_TESTED_RATIOS), so it carries over unchanged and the exon class already matches.
-    The other two are shared across introns, so the per-intron difference between the initiation
-    term and a read class is the same in every column and is averaged over them.
+    The other two are shared across introns, so each per-intron difference below is the same in
+    every column and is averaged over them.
     """
     _copy_shared_parameters(model_full, model_reduced)
     with torch.no_grad():
         exon_term, nascent_term, unspliced_term = model_reduced.get_lfc_terms_per_read_class(
             design_matrix, reduced_design_matrix)
         init_over_deg_per_intron = exon_term[:, model_reduced.gene_idx]
-        model_full.lfc_elong_over_deg.copy_(get_projection_onto_design(
-            design_matrix, (init_over_deg_per_intron - nascent_term).mean(dim=1)))
         model_full.lfc_splice_over_deg.copy_(get_projection_onto_design(
             design_matrix, (init_over_deg_per_intron - unspliced_term).mean(dim=1)))
+        model_full.lfc_elong_over_splice.copy_(get_projection_onto_design(
+            design_matrix, (unspliced_term - nascent_term).mean(dim=1)))
     absorb_read_class_shifts(model_full, model_reduced, design_matrix, reduced_design_matrix)
 
 
@@ -467,19 +465,25 @@ def _make_closures(
 
 
 # The ratios the prior is defined over, in the order `estimate_prior_variance.R` writes its
-# covariance columns. The other three ratios are differences of these, so penalising these three
-# jointly penalises all six; doing it with one covariance rather than six separate weights is what
-# keeps the implied prior a distribution at all.
-LFC_PRIOR_BASIS = (LFCParameter.INIT_OVER_DEG,
-                   LFCParameter.ELONG_OVER_DEG,
-                   LFCParameter.SPLICE_OVER_DEG)
+# covariance columns. The other three ratios are linear combinations of these, so penalising these
+# three jointly penalises all six; doing it with one covariance rather than six separate weights is
+# what keeps the implied prior a distribution at all.
+#
+# These are ratios rather than parameters, and need not be the three the models parametrize: the
+# basis is the wire format shared with `estimate_prior_variance.R`, so it is fixed by the column
+# names of `regularization_coefficients.tsv`. `get_prior_penalty` writes each basis ratio in terms
+# of the parameters through `RATIO_AS_LFC_COMBINATION`, which is also why the penalty itself is
+# unchanged by a change of basis: the quadratic form is the same one either way.
+LFC_PRIOR_BASIS = (TestedRatio.INIT_OVER_DEG,
+                   TestedRatio.ELONG_OVER_DEG,
+                   TestedRatio.SPLICE_OVER_DEG)
 
 
 def get_prior_precision(regularization_coefficients_df: pd.DataFrame,
                         feature_names: list[str],
                         device: str = 'cpu') -> torch.Tensor:
     """
-    The inverse prior covariance of the three parametrized ratios, per design column.
+    The inverse prior covariance of the three basis ratios, per design column.
 
     Reads the covariance `estimate_prior_variance.R` fitted jointly over those three and inverts
     it, giving the matrix the penalty is a quadratic form in. A design column whose covariance is
@@ -509,8 +513,12 @@ def get_prior_penalty(model: RNAKineticsModel, prior_precision: torch.Tensor) ->
 
     A Gaussian prior of covariance `Sigma` contributes `0.5 * t(theta) %*% inv(Sigma) %*% theta`,
     which for a one-dimensional prior reduces to `lambda * lfc^2` with
-    `lambda = 1 / (2 * sigma^2)`. Here `theta` is one design column's three parametrized ratios at
-    one intron, so the penalty sums over design columns and introns.
+    `lambda = 1 / (2 * sigma^2)`. Here `theta` is one design column's three basis ratios at one
+    intron, so the penalty sums over design columns and introns.
+
+    The basis ratios are read out of the model's parameters through `RATIO_AS_LFC_COMBINATION`
+    rather than named here, so the penalty is the same quadratic form in the same three linear
+    functionals however the model happens to be parametrized.
 
     The initiation LFC has no intron axis, so it enters once per intron of the gene. That matches
     how the prior was fitted, where a (gene, intron) pair is the unit and the gene's initiation
@@ -520,16 +528,25 @@ def get_prior_penalty(model: RNAKineticsModel, prior_precision: torch.Tensor) ->
     no covariance to invert and the penalty stays the plain `lambda * lfc^2` term in
     `_make_intron_coverage_closures`.
     """
-    # The width of the elongation and splicing LFCs' second axis: the introns when those LFCs are
+    # The width of the intron-axis LFCs' second axis: the introns when those LFCs are
     # intron-specific, and a broadcasting singleton when they are shared across the gene. It has to
     # come from the parameter rather than from `len(model.intron_names)`, which would be wrong in
     # the shared case and would try to expand initiation against a width-one axis.
-    num_lfc_introns = model.lfc_elong_over_deg.shape[1]
+    num_lfc_introns = model.lfc_splice_over_deg.shape[1]
+
+    def get_basis_ratio_lfc(basis_ratio: TestedRatio) -> torch.Tensor:
+        """One basis ratio's LFC, as (num_features, num_lfc_introns)."""
+        terms = []
+        for attribute, coefficient in RATIO_AS_LFC_COMBINATION[basis_ratio]:
+            lfc = getattr(model, attribute)
+            if lfc.dim() == 1:  # initiation, which the prior was fitted per intron as well
+                lfc = lfc.unsqueeze(1).expand(-1, num_lfc_introns)
+            terms.append(coefficient * lfc)
+        return torch.stack(terms).sum(dim=0)
+
     # (num_features, num_lfc_introns, 3), the three basis ratios per design column and intron
     lfc_per_basis_ratio = torch.stack(
-        [model.lfc_init_over_deg.unsqueeze(1).expand(-1, num_lfc_introns),
-         model.lfc_elong_over_deg,
-         model.lfc_splice_over_deg], dim=2)
+        [get_basis_ratio_lfc(basis_ratio) for basis_ratio in LFC_PRIOR_BASIS], dim=2)
     # One batched matmul per design column, then the elementwise product summed, which is
     # sum over design columns and introns of t(lfc) %*% prior_precision %*% lfc.
     precision_times_lfc = lfc_per_basis_ratio @ prior_precision
@@ -773,7 +790,7 @@ def add_wald_test_results(df_param: pd.DataFrame,
 
 
 def get_contrast_of_ratio(model: nn.Module,
-                          ratio_as_lfc_difference: tuple[str, Optional[str]],
+                          lfc_combination: LFCCombination,
                           lfc_column_positive,
                           lfc_column_negative,
                           intron_index: int = 0) -> dict[int, float]:
@@ -782,7 +799,7 @@ def get_contrast_of_ratio(model: nn.Module,
 
     Keys are rows of the flattened Fisher information and values their coefficients, so the dot
     product with the fitted parameters is the LFC itself. It is assembled from the same two pieces
-    as that LFC: the ratio as a difference of one or two LFC parameters, and the comparison as a
+    as that LFC: the ratio as a linear combination of LFC parameters, and the comparison as a
     difference of two design columns. A column that is absent contributes nothing, exactly as in
     `get_lfc_of_column`, which is how a single column is asked for -- pass it as the positive one
     and leave the negative NaN.
@@ -803,16 +820,13 @@ def get_contrast_of_ratio(model: nn.Module,
         index = (feature_index,) if lfc.dim() == 1 else (feature_index, intron_index)
         return parameter_offsets[lfc_attribute] + int(np.ravel_multi_index(index, lfc.shape))
 
-    numerator_attribute, denominator_attribute = ratio_as_lfc_difference
     contrast: dict[int, float] = {}
-    for lfc_attribute, ratio_sign in ((numerator_attribute, 1.0), (denominator_attribute, -1.0)):
-        if lfc_attribute is None:
-            continue
+    for lfc_attribute, ratio_coefficient in lfc_combination:
         for column_name, column_sign in ((lfc_column_positive, 1.0),
                                          (lfc_column_negative, -1.0)):
             row = get_row(lfc_attribute, column_name)
             if row is not None:
-                contrast[row] = contrast.get(row, 0.0) + ratio_sign * column_sign
+                contrast[row] = contrast.get(row, 0.0) + ratio_coefficient * column_sign
     return contrast
 
 
@@ -859,13 +873,13 @@ class RatioToReport(NamedTuple):
     """
     One rate ratio as it should appear in `ratio_lfcs`, for one intron or shared across them.
 
-    `lfc_difference` is the ratio decomposed into one or two LFC parameters, as
-    `RATIO_AS_LFC_DIFFERENCE` gives it for the per-gene model. `intron_name` is what the row is
+    `lfc_combination` is the ratio decomposed into (parameter, coefficient) pairs, as
+    `RATIO_AS_LFC_COMBINATION` gives it for the per-gene model. `intron_name` is what the row is
     labelled with and `intron_index` which column of an intron-specific LFC to read; both are
     unused for a ratio the model shares across introns.
     """
     ratio: str
-    lfc_difference: tuple[str, Optional[str]]
+    lfc_combination: LFCCombination
     intron_name: Optional[str] = None
     intron_index: int = 0
 
@@ -895,8 +909,8 @@ def get_ratio_lfc_df(model: nn.Module,
     state_dict = model.state_dict()
     rows: list[dict] = []
     for ratio_to_report in ratios_to_report:
-        lfc_of_ratio = get_lfc_of_lfc_difference(state_dict, ratio_to_report.lfc_difference,
-                                                 ratio_to_report.intron_index)
+        lfc_of_ratio = get_lfc_of_lfc_combination(state_dict, ratio_to_report.lfc_combination,
+                                                  ratio_to_report.intron_index)
         for feature_index, feature_name in enumerate(model.feature_names):
             lfc = lfc_of_ratio[feature_index].item()
             row = {'rate_ratio': ratio_to_report.ratio,
@@ -904,7 +918,7 @@ def get_ratio_lfc_df(model: nn.Module,
                    'feature_name': feature_name,
                    'lfc': lfc}
             if with_standard_errors:
-                contrast = get_contrast_of_ratio(model, ratio_to_report.lfc_difference,
+                contrast = get_contrast_of_ratio(model, ratio_to_report.lfc_combination,
                                                  lfc_column_positive=feature_name,
                                                  lfc_column_negative=np.nan,
                                                  intron_index=ratio_to_report.intron_index)
@@ -1133,7 +1147,7 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
     ratio_lfc_df = get_ratio_lfc_df(
         model_full, parameter_covariance,
         [RatioToReport(ratio=tested_ratio,
-                       lfc_difference=RATIO_AS_LFC_DIFFERENCE[tested_ratio],
+                       lfc_combination=RATIO_AS_LFC_COMBINATION[tested_ratio],
                        intron_name=intron_name,
                        intron_index=intron_index)
          for tested_ratio, intron_name, intron_index
@@ -1169,7 +1183,7 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
         test_result.update(get_contrast_wald_results(
             parameter_covariance,
             get_contrast_of_ratio(model_full,
-                                  RATIO_AS_LFC_DIFFERENCE[lrt_specification.tested_ratio],
+                                  RATIO_AS_LFC_COMBINATION[lrt_specification.tested_ratio],
                                   test_result['lfc_column_positive'],
                                   test_result['lfc_column_negative'],
                                   tested_intron_index),
@@ -1225,7 +1239,7 @@ def get_regularized_rna_kinetics_model_results(gene_data: GeneData,
     ratio_lfc_df = get_ratio_lfc_df(
         model_regularized, parameter_covariance=None, with_standard_errors=False,
         ratios_to_report=[RatioToReport(ratio=tested_ratio,
-                                        lfc_difference=RATIO_AS_LFC_DIFFERENCE[tested_ratio],
+                                        lfc_combination=RATIO_AS_LFC_COMBINATION[tested_ratio],
                                         intron_name=intron_name,
                                         intron_index=intron_index)
                           for tested_ratio, intron_name, intron_index
@@ -1342,7 +1356,7 @@ def get_intron_coverage_model_results(
     ratio_lfc_df = get_ratio_lfc_df(
         model_full, parameter_covariance,
         [RatioToReport(ratio=LFCParameter.ELONG_OVER_SPLICE,
-                       lfc_difference=(LFCParameter.ELONG_OVER_SPLICE, None),
+                       lfc_combination=((LFCParameter.ELONG_OVER_SPLICE, 1.0),),
                        intron_name=lfc_intron_name)])
     ratio_lfc_df['training_diverged_full_model'] = results_full.training_diverged
 
@@ -1368,7 +1382,7 @@ def get_intron_coverage_model_results(
             # rather than a column of nulls.
             test_result.update(get_contrast_wald_results(
                 parameter_covariance,
-                get_contrast_of_ratio(model_full, (LFCParameter.ELONG_OVER_SPLICE, None),
+                get_contrast_of_ratio(model_full, ((LFCParameter.ELONG_OVER_SPLICE, 1.0),),
                                       lrt_row['lfc_column_positive'],
                                       lrt_row['lfc_column_negative']),
                 test_result['lfc']))
@@ -1494,7 +1508,7 @@ def get_global_rna_kinetics_model_results(
     def fit(model: GlobalRNAKineticsModel,
             reduced_matrix: Optional[torch.Tensor],
             label: str) -> tuple[GlobalRNAKineticsModel, TrainingResults]:
-        global_param_names = {LFCParameter.ELONG_OVER_DEG, LFCParameter.SPLICE_OVER_DEG}
+        global_param_names = {LFCParameter.ELONG_OVER_SPLICE, LFCParameter.SPLICE_OVER_DEG}
         if reduced_matrix is not None:
             global_param_names = global_param_names | {'reduced_lfc'}
         return _train_two_stage(
@@ -1618,7 +1632,7 @@ def get_regularized_intron_coverage_model_results(
     ratio_lfc_df = get_ratio_lfc_df(
         model_regularized, parameter_covariance=None, with_standard_errors=False,
         ratios_to_report=[RatioToReport(ratio=LFCParameter.ELONG_OVER_SPLICE,
-                                        lfc_difference=(LFCParameter.ELONG_OVER_SPLICE, None),
+                                        lfc_combination=((LFCParameter.ELONG_OVER_SPLICE, 1.0),),
                                         intron_name=lfc_intron_name)])
     ratio_lfc_df['gene_name'] = input_data.gene_name
     return RegularizedFitResults(model_parameters=model_param_df, ratio_lfcs=ratio_lfc_df)

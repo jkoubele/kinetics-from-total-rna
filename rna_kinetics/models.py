@@ -26,13 +26,17 @@ class LFCParameter(StrEnum):
     The models' log fold change parameters, by attribute name.
 
     Separate from TestedRatio, which enumerates hypotheses rather than parameters, though every
-    parameter here is also a tested ratio under the same name. The two tested ratios that are not
-    parameters, init/elong and init/splice, are differences of two.
+    parameter here is also a tested ratio under the same name. The three tested ratios that are
+    not parameters, elong/deg, init/elong and init/splice, are linear combinations of these.
+
+    Which three of the six ratios carry the parametrization is a free choice, and these three are
+    the ones the models build their predictions from directly. elong/splice is the whole of the
+    nascent fraction's logit shift, which is the ratio the coverage shape is informative about, so
+    `IntronCoverageModel` parametrizes that same ratio under this same name.
     """
     INIT_OVER_DEG = 'lfc_init_over_deg'
-    ELONG_OVER_DEG = 'lfc_elong_over_deg'
-    SPLICE_OVER_DEG = 'lfc_splice_over_deg'
     ELONG_OVER_SPLICE = 'lfc_elong_over_splice'
+    SPLICE_OVER_DEG = 'lfc_splice_over_deg'
 
 
 class TestedRatio(StrEnum):
@@ -40,8 +44,8 @@ class TestedRatio(StrEnum):
     Which rate ratio an LRT restricts.
 
     All six ratios of the four rates are testable. Three of them are model parameters; the other
-    three are differences of two parameters, which is well-defined because every parameter is a
-    ratio against degradation, so the degradation term cancels in the difference.
+    three are linear combinations of those, which is well-defined because four rates admit only
+    three independent ratios and the parametrized three span them.
 
     The values are the LFC attribute names, and are written verbatim to the `rate_ratio`
     column of the test results and on into the volcano plot paths. The three ratios that are not
@@ -55,16 +59,28 @@ class TestedRatio(StrEnum):
     ELONG_OVER_SPLICE = 'lfc_elong_over_splice'
 
 
-# Each tested ratio as a difference of LFC parameters, with None for a ratio that is a single
-# parameter. Used to build the reduced model's hot start and to report the effect size, both of
-# which need the full model's value of the ratio rather than of one parameter.
-RATIO_AS_LFC_DIFFERENCE: dict[TestedRatio, tuple[LFCParameter, Optional[LFCParameter]]] = {
-    TestedRatio.INIT_OVER_DEG: (LFCParameter.INIT_OVER_DEG, None),
-    TestedRatio.ELONG_OVER_DEG: (LFCParameter.ELONG_OVER_DEG, None),
-    TestedRatio.SPLICE_OVER_DEG: (LFCParameter.SPLICE_OVER_DEG, None),
-    TestedRatio.INIT_OVER_ELONG: (LFCParameter.INIT_OVER_DEG, LFCParameter.ELONG_OVER_DEG),
-    TestedRatio.INIT_OVER_SPLICE: (LFCParameter.INIT_OVER_DEG, LFCParameter.SPLICE_OVER_DEG),
-    TestedRatio.ELONG_OVER_SPLICE: (LFCParameter.ELONG_OVER_DEG, LFCParameter.SPLICE_OVER_DEG),
+# One rate ratio written in the model's parameters: (parameter, coefficient) pairs whose weighted
+# sum is that ratio's LFC. A single pair of coefficient 1.0 is a ratio that is a parameter itself.
+LFCCombination = tuple[tuple[str, float], ...]
+
+# Each tested ratio as such a combination. Used to build the reduced model's hot start, to report
+# the effect size and to assemble the Wald contrast, none of which can read a single parameter for
+# the three ratios that are not parametrized.
+#
+# Which ratios take more than one term follows from the parametrization and not from the biology.
+# With elong/splice and splice/deg parametrized, elong/deg is their sum, and init/elong is
+# init/deg less both.
+RATIO_AS_LFC_COMBINATION: dict[TestedRatio, LFCCombination] = {
+    TestedRatio.INIT_OVER_DEG: ((LFCParameter.INIT_OVER_DEG, 1.0),),
+    TestedRatio.ELONG_OVER_DEG: ((LFCParameter.ELONG_OVER_SPLICE, 1.0),
+                                 (LFCParameter.SPLICE_OVER_DEG, 1.0)),
+    TestedRatio.SPLICE_OVER_DEG: ((LFCParameter.SPLICE_OVER_DEG, 1.0),),
+    TestedRatio.INIT_OVER_ELONG: ((LFCParameter.INIT_OVER_DEG, 1.0),
+                                  (LFCParameter.ELONG_OVER_SPLICE, -1.0),
+                                  (LFCParameter.SPLICE_OVER_DEG, -1.0)),
+    TestedRatio.INIT_OVER_SPLICE: ((LFCParameter.INIT_OVER_DEG, 1.0),
+                                   (LFCParameter.SPLICE_OVER_DEG, -1.0)),
+    TestedRatio.ELONG_OVER_SPLICE: ((LFCParameter.ELONG_OVER_SPLICE, 1.0),),
 }
 
 # The global model's lfc_init_over_deg is per gene rather than shared, so no ratio involving
@@ -234,10 +250,10 @@ class RNAKineticsModel(nn.Module):
         self.intercept_exon = nn.Parameter(torch.zeros(1))
 
         if intron_specific_lfc:
-            self.lfc_elong_over_deg = nn.Parameter(torch.zeros(num_features, num_introns))
+            self.lfc_elong_over_splice = nn.Parameter(torch.zeros(num_features, num_introns))
             self.lfc_splice_over_deg = nn.Parameter(torch.zeros(num_features, num_introns))
         else:
-            self.lfc_elong_over_deg = nn.Parameter(torch.zeros(num_features, 1))
+            self.lfc_elong_over_splice = nn.Parameter(torch.zeros(num_features, 1))
             self.lfc_splice_over_deg = nn.Parameter(torch.zeros(num_features, 1))
         self.intron_specific_lfc = intron_specific_lfc
 
@@ -284,25 +300,33 @@ class RNAKineticsModel(nn.Module):
         """
         LFC term of each read class the model predicts. Unrestricted, the three are
 
-            exon      = X @ alpha
-            nascent   = X @ (alpha - beta)
-            unspliced = X @ (alpha - gamma)
+            exon      = X @ lfc_init_over_deg
+            unspliced = X @ lfc_init_over_deg - X @ lfc_splice_over_deg
+            nascent   = unspliced - X @ lfc_elong_over_splice
 
-        and every LRT is a single substitution here: the term of the rate ratio under test is
-        built from the reduced design matrix, while the other read classes keep the full one.
-        Which ratio is tested therefore decides which read class gets substituted.
+        Writing the nascent class as a shift of the unspliced one is what this parametrization
+        buys: that shift is the entirety of the nascent fraction's logit (see `forward`), so it is
+        the same quantity `IntronCoverageModel` reads off the coverage shape, under the same name.
+        It also matches how the intercepts are built, where the unspliced class is the base and the
+        nascent one is `intercept_pi_logit` above it.
+
+        Every LRT is a single substitution here: the term of the rate ratio under test is built
+        from the reduced design matrix, while the other read classes keep the full one. Which ratio
+        is tested therefore decides which read class gets substituted.
 
         The exon term is (num_samples,); the intron terms are (num_samples, num_introns), or
         (num_samples, 1) broadcasting over introns when the LFCs are shared across them.
         """
         init_over_deg_term = design_matrix @ self.lfc_init_over_deg
-        elong_over_deg_term = design_matrix @ self.lfc_elong_over_deg
+        elong_over_splice_term = design_matrix @ self.lfc_elong_over_splice
         splice_over_deg_term = design_matrix @ self.lfc_splice_over_deg
+        init_over_deg_per_intron = init_over_deg_term.unsqueeze(1)
 
         if self.lrt_specification is None:
+            unspliced_term = init_over_deg_per_intron - splice_over_deg_term
             return (init_over_deg_term,
-                    init_over_deg_term.unsqueeze(1) - elong_over_deg_term,
-                    init_over_deg_term.unsqueeze(1) - splice_over_deg_term)
+                    unspliced_term - elong_over_splice_term,
+                    unspliced_term)
 
         if reduced_design_matrix is None:
             raise ValueError(
@@ -311,42 +335,46 @@ class RNAKineticsModel(nn.Module):
         # Stands in for whichever LFC is under test, so below it is used in exactly the position
         # that LFC occupies in the unrestricted terms.
         reduced_lfc_term = reduced_design_matrix @ self.reduced_lfc  # (num_samples,)
+        reduced_per_intron = reduced_lfc_term.unsqueeze(1)
         tested_ratio = self.lrt_specification.tested_ratio
 
         if tested_ratio == TestedRatio.INIT_OVER_DEG:
-            # alpha feeds all three read classes and is never intron-specific, so all three are
-            # rebuilt. It enters each of them positively.
-            reduced_init_per_intron = reduced_lfc_term.unsqueeze(1)
+            # init/deg feeds all three read classes and is never intron-specific, so all three
+            # are rebuilt. It enters each of them positively.
+            unspliced_term = reduced_per_intron - splice_over_deg_term
             return (reduced_lfc_term,
-                    reduced_init_per_intron - elong_over_deg_term,
-                    reduced_init_per_intron - splice_over_deg_term)
+                    unspliced_term - elong_over_splice_term,
+                    unspliced_term)
 
-        init_over_deg_per_intron = init_over_deg_term.unsqueeze(1)
-        nascent_term = init_over_deg_per_intron - elong_over_deg_term
         unspliced_term = init_over_deg_per_intron - splice_over_deg_term
-        reduced_per_intron = reduced_lfc_term.unsqueeze(1)
 
         # Each remaining ratio is restricted by rebuilding one intron read class from the reduced
         # term, in the place that ratio occupies:
-        #   elong/deg  = init - nascent      so the nascent class becomes init - reduced
-        #   splice/deg = init - unspliced    so the unspliced class becomes init - reduced
-        #   init/elong = nascent             so the nascent class becomes the reduced term itself
-        #   init/splice = unspliced          so the unspliced class becomes the reduced term
-        #   elong/splice = unspliced - nascent    so the unspliced class becomes nascent + reduced
-        if tested_ratio == TestedRatio.ELONG_OVER_DEG:
-            nascent_term = self._get_restricted_intron_term(
-                nascent_term, init_over_deg_per_intron - reduced_per_intron)
-        elif tested_ratio == TestedRatio.SPLICE_OVER_DEG:
+        #   splice/deg   = init - unspliced     so the unspliced class becomes init - reduced
+        #   init/splice  = unspliced            so the unspliced class becomes the reduced term
+        #   elong/splice = unspliced - nascent  so the nascent class becomes unspliced - reduced
+        #   elong/deg    = init - nascent       so the nascent class becomes init - reduced
+        #   init/elong   = nascent              so the nascent class becomes the reduced term
+        # The first two restrict splice/deg, which the nascent class carries too, so there the
+        # nascent term is built from the restricted unspliced term rather than from the full one.
+        if tested_ratio == TestedRatio.SPLICE_OVER_DEG:
             unspliced_term = self._get_restricted_intron_term(
                 unspliced_term, init_over_deg_per_intron - reduced_per_intron)
-        elif tested_ratio == TestedRatio.INIT_OVER_ELONG:
-            nascent_term = self._get_restricted_intron_term(nascent_term, reduced_per_intron)
+            nascent_term = unspliced_term - elong_over_splice_term
         elif tested_ratio == TestedRatio.INIT_OVER_SPLICE:
             unspliced_term = self._get_restricted_intron_term(unspliced_term, reduced_per_intron)
+            nascent_term = unspliced_term - elong_over_splice_term
         elif tested_ratio == TestedRatio.ELONG_OVER_SPLICE:
-            unspliced_term = self._get_restricted_intron_term(
-                unspliced_term,
-                self._get_tested_intron_column(nascent_term) + reduced_per_intron)
+            nascent_term = self._get_restricted_intron_term(
+                unspliced_term - elong_over_splice_term,
+                self._get_tested_intron_column(unspliced_term) - reduced_per_intron)
+        elif tested_ratio == TestedRatio.ELONG_OVER_DEG:
+            nascent_term = self._get_restricted_intron_term(
+                unspliced_term - elong_over_splice_term,
+                init_over_deg_per_intron - reduced_per_intron)
+        elif tested_ratio == TestedRatio.INIT_OVER_ELONG:
+            nascent_term = self._get_restricted_intron_term(
+                unspliced_term - elong_over_splice_term, reduced_per_intron)
         else:
             raise ValueError(f'Unhandled tested ratio: {tested_ratio!r}')
 
@@ -417,7 +445,7 @@ class RNAKineticsModel(nn.Module):
         return build_param_df(self, {
             'intercept_exon': (None,),
             'lfc_init_over_deg': ('feature',),
-            'lfc_elong_over_deg': ('feature', lfc_intron_axis),
+            'lfc_elong_over_splice': ('feature', lfc_intron_axis),
             'lfc_splice_over_deg': ('feature', lfc_intron_axis),
             'intercept_unspliced': ('intron',),
             'intercept_pi_logit': ('intron',),
@@ -440,6 +468,11 @@ class IntronCoverageModel(nn.Module):
         # singleton so that the term broadcasts against the per-intron intercept; it is never an
         # intron axis. Fitting this model per intron means constructing it with that one intron,
         # and then its LFC is reported under that intron's name -- see get_param_df.
+        #
+        # The name is shared with `RNAKineticsModel`'s parameter of the same ratio deliberately:
+        # that model's nascent fraction responds to exactly this LFC, so the two estimate the same
+        # quantity. The coverage term of the likelihood is the same in both; this model has only
+        # that term, while `RNAKineticsModel` has the read counts on top of it.
         self.lfc_elong_over_splice = nn.Parameter(torch.zeros(num_features, 1))
         self.intercept_pi_logit = nn.Parameter(torch.zeros(num_introns))
 
@@ -484,7 +517,7 @@ class GlobalRNAKineticsModel(nn.Module):
         num_introns = len(intron_names)
 
         self.lfc_init_over_deg = nn.Parameter(torch.zeros(num_genes, num_features))
-        self.lfc_elong_over_deg = nn.Parameter(torch.zeros(num_features))
+        self.lfc_elong_over_splice = nn.Parameter(torch.zeros(num_features))
         self.lfc_splice_over_deg = nn.Parameter(torch.zeros(num_features))
         self.intercept_exon = nn.Parameter(torch.zeros(num_genes))
         self.intercept_unspliced = nn.Parameter(torch.zeros(num_introns))
@@ -534,18 +567,17 @@ class GlobalRNAKineticsModel(nn.Module):
         LFC term of each read class the model predicts, shaped (num_samples, num_genes),
         (num_samples, num_introns) and (num_samples, num_introns).
 
-        Same three terms as RNAKineticsModel (exon = X @ alpha, nascent = X @ (alpha - beta),
-        unspliced = X @ (alpha - gamma)), except that alpha is per gene here while beta and gamma
-        are shared, so the exon class is indexed by gene and the intron classes are expanded
-        through gene_idx.
+        Same three terms as RNAKineticsModel, except that lfc_init_over_deg is per gene here while
+        the other two are shared, so the exon class is indexed by gene and the intron classes are
+        expanded through gene_idx.
         """
         init_over_deg_term = design_matrix @ self.lfc_init_over_deg.T  # (num_samples, num_genes)
         init_over_deg_per_intron = init_over_deg_term[:, self.gene_idx]  # (num_samples, num_introns)
 
-        nascent_term = (init_over_deg_per_intron
-                        - (design_matrix @ self.lfc_elong_over_deg).unsqueeze(1))
+        elong_over_splice_term = (design_matrix @ self.lfc_elong_over_splice).unsqueeze(1)
         unspliced_term = (init_over_deg_per_intron
                           - (design_matrix @ self.lfc_splice_over_deg).unsqueeze(1))
+        nascent_term = unspliced_term - elong_over_splice_term
 
         if self.lrt_specification is not None:
             if reduced_design_matrix is None:
@@ -553,15 +585,18 @@ class GlobalRNAKineticsModel(nn.Module):
             # Stands in for whichever LFC is under test, used in the place that ratio occupies:
             #   elong/deg    = init - nascent          so nascent becomes init - reduced
             #   splice/deg   = init - unspliced        so unspliced becomes init - reduced
-            #   elong/splice = unspliced - nascent     so unspliced becomes nascent + reduced
+            #   elong/splice = unspliced - nascent     so nascent becomes unspliced - reduced
+            # splice/deg is carried by the nascent class too, so there the nascent term is
+            # rebuilt from the restricted unspliced term.
             reduced_lfc_term = (reduced_design_matrix @ self.reduced_lfc).unsqueeze(1)
             tested_ratio = self.lrt_specification.tested_ratio
             if tested_ratio == TestedRatio.ELONG_OVER_DEG:
                 nascent_term = init_over_deg_per_intron - reduced_lfc_term
             elif tested_ratio == TestedRatio.SPLICE_OVER_DEG:
                 unspliced_term = init_over_deg_per_intron - reduced_lfc_term
+                nascent_term = unspliced_term - elong_over_splice_term
             elif tested_ratio == TestedRatio.ELONG_OVER_SPLICE:
-                unspliced_term = nascent_term + reduced_lfc_term
+                nascent_term = unspliced_term - reduced_lfc_term
             else:
                 raise ValueError(f'Unhandled tested ratio: {tested_ratio!r}')
 
@@ -607,7 +642,7 @@ class GlobalRNAKineticsModel(nn.Module):
         return build_param_df(self, {
             'intercept_exon': ('gene',),
             'lfc_init_over_deg': ('gene', 'feature'),
-            'lfc_elong_over_deg': ('feature',),
+            'lfc_elong_over_splice': ('feature',),
             'lfc_splice_over_deg': ('feature',),
             'intercept_unspliced': ('intron',),
             'intercept_pi_logit': ('intron',),

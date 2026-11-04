@@ -65,10 +65,11 @@ if (!dir.exists(output_folder)) {
 # are differences of these, so their priors follow from the same matrix instead of being fitted.
 #
 # An input that does not hold all three, such as the intron coverage model's single
-# lfc_elong_over_splice, has no such structure to exploit. The same name means different things in
-# the two models: a difference of two parameters in one, a parameter in its own right in the other.
-# Those inputs are therefore fitted one ratio at a time. Dispatching on what the input contains
-# rather than assuming is what keeps a coverage model from silently receiving no prior at all.
+# lfc_elong_over_splice, has no such structure to exploit and is fitted one ratio at a time. That
+# is a statement about which ratios the input table covers, not about how either model is
+# parametrized: lfc_elong_over_splice is a parameter of both. Dispatching on what the input
+# contains rather than assuming is what keeps a coverage model from silently receiving no prior at
+# all.
 BASIS <- c("lfc_init_over_deg", "lfc_elong_over_deg", "lfc_splice_over_deg")
 
 # Each remaining ratio as the pair of basis ratios it is the difference of. This is what turns the
