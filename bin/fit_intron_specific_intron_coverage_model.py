@@ -14,6 +14,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--modeled_introns', type=Path, required=True,
                         help='TSV with intron IDs and gene IDs to model.')
+    parser.add_argument('--modeled_genes', type=Path, default=None,
+                        help='Optional TSV file with modeled genes. When given, only introns of '
+                             'those genes are fitted, which lets this fit be driven by the same '
+                             'gene chunk file as the per-gene models.')
     parser.add_argument('--design_matrix', type=Path, required=True)
     parser.add_argument('--library_size_factors', type=Path, required=True)
     parser.add_argument('--coverage_data_folder', type=Path, required=True)
@@ -34,6 +38,7 @@ if __name__ == "__main__":
 
     intron_data_list = load_intron_coverage_list(
         modeled_introns_file=args.modeled_introns,
+        modeled_genes_file=args.modeled_genes,
         coverage_folder=args.coverage_data_folder,
         sample_names=dataset_metadata.sample_names,
     )

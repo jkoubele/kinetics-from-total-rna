@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -199,6 +200,11 @@ def load_gene_data_list(modeled_genes_file: Path,
     for gene_id in tqdm(modeled_genes_df['gene_id'], desc='Preparing gene data'):
         exon_row = exon_counts_df.loc[gene_id]
 
+        if gene_id not in gene_to_introns:
+            raise ValueError(f'Gene {gene_id} is modeled but has no intron in '
+                             f'{modeled_introns_file}. Every modeled gene must have at least one '
+                             f'modeled intron.')
+
         # Sort introns by position in the gene
         gene_intron_names = sorted(
             gene_to_introns[gene_id],
@@ -235,8 +241,16 @@ def load_intron_coverage_list(
         modeled_introns_file: Path,
         coverage_folder: Path,
         sample_names: list[str],
+        modeled_genes_file: Optional[Path] = None,
 ) -> list[IntronData]:
     introns_df = pd.read_csv(modeled_introns_file, sep='\t')
+
+    # Lets a per-intron fit be driven by the same gene chunk file as a per-gene fit, so the two
+    # cover the same genes by construction rather than through a second chunking of the introns
+    # that would have to be kept in step with the gene chunks.
+    if modeled_genes_file is not None:
+        modeled_genes_df = pd.read_csv(modeled_genes_file, sep='\t')
+        introns_df = introns_df[introns_df['gene_id'].isin(set(modeled_genes_df['gene_id']))]
 
     coverage_df_by_sample: dict[str, pd.DataFrame] = {}
     for sample_name in tqdm(sample_names, desc='Loading coverage data'):
