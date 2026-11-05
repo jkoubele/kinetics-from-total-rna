@@ -9,7 +9,8 @@ import torch
 from tqdm import tqdm
 
 from rna_kinetics.data import load_dataset_metadata
-from rna_kinetics.estimation import get_intron_coverage_model_results
+from rna_kinetics.estimation import (get_intron_coverage_model_results,
+                                     concat_plug_in_coverage_fits)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -81,3 +82,8 @@ if __name__ == "__main__":
         args.output_folder / 'model_parameters.tsv', sep='\t', index=False
     )
     results.test_results.to_csv(args.output_folder / 'test_results.tsv', sep='\t', index=False)
+    # One fit over every intron in the dataset, so one record, and no covariance: this model
+    # computes no Fisher information.
+    torch.save(concat_plug_in_coverage_fits([results.plug_in_coverage_fit],
+                                            dataset_metadata.feature_names),
+               args.output_folder / 'plug_in_coverage_fits.pt')

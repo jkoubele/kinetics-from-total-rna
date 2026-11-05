@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Callable, Iterator, NamedTuple, Optional, OrderedDict
 
 import numpy as np
@@ -35,6 +36,65 @@ class CacheForRegularization:
     intron_specific_lfc: Optional[bool] = None  # RNAKineticsModel only: LFC parameter shape
 
 
+class CoverageFitStatus(StrEnum):
+    """
+    Whether one intron's coverage fit can be used as a plug-in value.
+
+    Single-valued, with `training_diverged` taking precedence over `not_estimable`, because the
+    only question a consumer asks is whether the fit is usable. The individual diagnostics stay in
+    `model_parameters.tsv`, which reports the divergence flag and the Wald columns separately.
+    """
+    OK = 'ok'
+    TRAINING_DIVERGED = 'training_diverged'
+    NOT_ESTIMABLE = 'not_estimable'
+
+
+@dataclass
+class PlugInCoverageFit:
+    """
+    One `IntronCoverageModel` fit, in the form a plug-in estimator consumes.
+
+    A plug-in stage two freezes a whole coverage fit at once, so the variance correction needs the
+    joint covariance of everything that fit estimated: one `lfc_elong_over_splice` together with
+    the intercepts of every intron it was fitted over. The three granularities of the coverage
+    model differ only in the length of `intron_names`, which is one intron, a gene's introns, or
+    the whole dataset's.
+
+    `lfc_elong_over_splice` is (num_features,), shared across `intron_names`, and
+    `intercept_pi_logit` is (num_introns,). Both also appear in `model_parameters.tsv`; they are
+    carried here so that the artifact stands on its own and a consumer needs no join against a
+    published table.
+
+    `covariance` is the inverse Fisher information over those same values, in that order, so it is
+    square of side `num_features + num_introns`. It is the one quantity the TSVs have no column
+    for, which is the reason this artifact exists: `model_parameters.tsv` reports only its
+    diagonal, as `SE`. None when there is no covariance to report, which `status` then explains.
+    """
+    intron_names: list[str]
+    lfc_elong_over_splice: torch.Tensor  # (num_features,)
+    intercept_pi_logit: torch.Tensor  # (num_introns,)
+    covariance: Optional[torch.Tensor]  # (num_features + num_introns) square, or None
+    status: CoverageFitStatus
+
+
+@dataclass
+class PlugInCoverageFits:
+    """
+    The coverage fits of one chunk, pickled via `torch.save` for a later process.
+
+    A wire format, so the field names cross a process boundary. Chunks merge by concatenating
+    `fits`. `feature_names` describes the design, which every fit in the chunk shares and which is
+    what makes the covariance axes readable on the far side; `intron_names` describes a single fit
+    and so sits on it.
+
+    `is_regularized` says these came from the penalized refit, whose fits carry no covariance: the
+    Hessian of a penalized objective is not an information matrix.
+    """
+    fits: list[PlugInCoverageFit]
+    feature_names: list[str]
+    is_regularized: bool = False
+
+
 class ModelFitResults(NamedTuple):
     """
     Everything one fit of a full model reports.
@@ -44,11 +104,15 @@ class ModelFitResults(NamedTuple):
     the empirical Bayes step consumes, since the L2 penalty acts per column. `test_results` has
     one row per likelihood ratio test. `state_dict_full_model` is the hot start cached for the
     regularized refit.
+
+    `plug_in_coverage_fit` is set by the coverage models and is None for the others, which have no
+    coverage-only fit to hand on.
     """
     model_parameters: pd.DataFrame
     ratio_lfcs: pd.DataFrame
     test_results: pd.DataFrame
     state_dict_full_model: StateDict
+    plug_in_coverage_fit: Optional[PlugInCoverageFit] = None
 
 
 class RegularizedFitResults(NamedTuple):
@@ -60,9 +124,13 @@ class RegularizedFitResults(NamedTuple):
     regularized effect size of every rate ratio can be joined onto the test results directly,
     rather than rebuilt downstream from the parameter table, which has no row for the three ratios
     that are not parameters.
+
+    `plug_in_coverage_fit` is set by the coverage models only, and carries no covariance for the
+    same reason `ratio_lfcs` carries no standard errors.
     """
     model_parameters: pd.DataFrame
     ratio_lfcs: pd.DataFrame
+    plug_in_coverage_fit: Optional[PlugInCoverageFit] = None
 
 
 class LRTInputs(NamedTuple):
@@ -751,6 +819,81 @@ def get_parameter_covariance(
                                num_parameters=fisher_information_matrix.shape[0])
 
 
+def get_plug_in_coverage_fit(model: IntronCoverageModel,
+                             parameter_covariance: Optional[ParameterCovariance],
+                             training_diverged: bool,
+                             computes_fisher_information: bool = True) -> PlugInCoverageFit:
+    """
+    Read one `IntronCoverageModel` fit into the plug-in record, whatever its granularity.
+
+    The covariance is the submatrix of the inverse Fisher information on this fit's parameters,
+    addressed through `get_flat_parameter_offsets` the same way the Wald contrasts are, so this
+    inherits the positional row order rather than assuming one. For a fit of all its own
+    parameters that submatrix is the whole matrix; it is written as a selection anyway, because the
+    identifiable subspace can be smaller.
+
+    A single unidentifiable row leaves the whole covariance as None, since stage two freezes the
+    parameters as a vector and a correction built from part of that vector would be wrong rather
+    than partial.
+
+    `computes_fisher_information` is False for the penalized refit and the genome-wide variant,
+    neither of which builds a Fisher information at all, so an absent covariance there is not a
+    failed fit.
+    """
+    with torch.no_grad():
+        lfc_elong_over_splice = model.lfc_elong_over_splice.detach()[:, 0].cpu()
+        intercept_pi_logit = model.intercept_pi_logit.detach().cpu()
+
+    covariance: Optional[torch.Tensor] = None
+    if parameter_covariance is not None:
+        offsets = get_flat_parameter_offsets(dict(model.named_parameters()))
+        parameter_rows = (
+                [offsets[LFCParameter.ELONG_OVER_SPLICE] + feature_index
+                 for feature_index in range(len(model.feature_names))]
+                + [offsets['intercept_pi_logit'] + intron_index
+                   for intron_index in range(len(model.intron_names))])
+        position_of_row = {row: position
+                           for position, row in enumerate(parameter_covariance.rows)}
+        if all(row in position_of_row for row in parameter_rows):
+            positions = [position_of_row[row] for row in parameter_rows]
+            covariance = parameter_covariance.matrix[positions][:, positions]
+
+    if training_diverged:
+        status = CoverageFitStatus.TRAINING_DIVERGED
+    elif covariance is None and computes_fisher_information:
+        status = CoverageFitStatus.NOT_ESTIMABLE
+    else:
+        status = CoverageFitStatus.OK
+
+    return PlugInCoverageFit(intron_names=list(model.intron_names),
+                             lfc_elong_over_splice=lfc_elong_over_splice,
+                             intercept_pi_logit=intercept_pi_logit,
+                             covariance=covariance,
+                             status=status)
+
+
+def concat_plug_in_coverage_fits(fits: list[PlugInCoverageFit],
+                                 feature_names: list[str],
+                                 is_regularized: bool = False) -> PlugInCoverageFits:
+    """
+    Collect one chunk's fits into the artifact it writes.
+
+    `feature_names` is passed in, so that a chunk holding no fits still writes a well-formed
+    artifact, and so that a covariance of the wrong width is caught here rather than much later as
+    a correction built from the wrong parameters.
+    """
+    for fit in fits:
+        expected_side = len(feature_names) + len(fit.intron_names)
+        expected_shape = (expected_side, expected_side)
+        if fit.covariance is not None and tuple(fit.covariance.shape) != expected_shape:
+            raise ValueError(
+                f'Coverage fit of {fit.intron_names} has a {tuple(fit.covariance.shape)} '
+                f'covariance, expected {expected_shape} for '
+                f'{len(feature_names)} features.')
+    return PlugInCoverageFits(fits=list(fits), feature_names=list(feature_names),
+                              is_regularized=is_regularized)
+
+
 def add_wald_test_results(df_param: pd.DataFrame,
                           parameter_covariance: Optional[ParameterCovariance],
                           fisher_information_matrix: torch.Tensor) -> pd.DataFrame:
@@ -1396,10 +1539,15 @@ def get_intron_coverage_model_results(
         test_result['num_full_model_restarts'] = fits.num_full_model_restarts
         test_results_list.append(test_result)
 
-    return ModelFitResults(model_parameters=model_param_df,
-                           ratio_lfcs=ratio_lfc_df,
-                           test_results=pd.DataFrame(test_results_list),
-                           state_dict_full_model=model_full.state_dict())
+    return ModelFitResults(
+        model_parameters=model_param_df,
+        ratio_lfcs=ratio_lfc_df,
+        test_results=pd.DataFrame(test_results_list),
+        state_dict_full_model=model_full.state_dict(),
+        plug_in_coverage_fit=get_plug_in_coverage_fit(
+            model_full, parameter_covariance,
+            training_diverged=results_full.training_diverged,
+            computes_fisher_information=not is_global_model))
 
 
 def _make_global_rna_kinetics_closures(
@@ -1635,4 +1783,10 @@ def get_regularized_intron_coverage_model_results(
                                         lfc_combination=((LFCParameter.ELONG_OVER_SPLICE, 1.0),),
                                         intron_name=lfc_intron_name)])
     ratio_lfc_df['gene_name'] = input_data.gene_name
-    return RegularizedFitResults(model_parameters=model_param_df, ratio_lfcs=ratio_lfc_df)
+    return RegularizedFitResults(
+        model_parameters=model_param_df,
+        ratio_lfcs=ratio_lfc_df,
+        plug_in_coverage_fit=get_plug_in_coverage_fit(
+            model_regularized, parameter_covariance=None,
+            training_diverged=training_results_regularized.training_diverged,
+            computes_fisher_information=False))

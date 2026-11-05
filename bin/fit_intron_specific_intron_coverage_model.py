@@ -8,7 +8,8 @@ import torch
 from tqdm import tqdm
 
 from rna_kinetics.data import load_dataset_metadata, load_intron_coverage_list
-from rna_kinetics.estimation import get_intron_coverage_model_results, CacheForRegularization
+from rna_kinetics.estimation import (get_intron_coverage_model_results, CacheForRegularization,
+                                     PlugInCoverageFit, concat_plug_in_coverage_fits)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -47,6 +48,7 @@ if __name__ == "__main__":
     ratio_lfcs_list: list[pd.DataFrame] = []
     test_results_list: list[pd.DataFrame] = []
     training_inputs: list[tuple] = []
+    plug_in_coverage_fits: list[PlugInCoverageFit] = []
 
     for intron_data in tqdm(intron_data_list):
         results = get_intron_coverage_model_results(
@@ -63,6 +65,7 @@ if __name__ == "__main__":
         ratio_lfcs_list.append(results.ratio_lfcs)
         test_results_list.append(results.test_results)
         training_inputs.append((intron_data, results.state_dict_full_model))
+        plug_in_coverage_fits.append(results.plug_in_coverage_fit)
 
     pd.concat(model_params_list).reset_index(drop=True).to_csv(
         args.output_folder / f'model_parameters{args.output_name_suffix}.tsv', sep='\t', index=False
@@ -80,3 +83,6 @@ if __name__ == "__main__":
     )
     torch.save(cache_for_regularization,
                args.output_folder / f'cache_for_regularization{args.output_name_suffix}.pt')
+    torch.save(concat_plug_in_coverage_fits(plug_in_coverage_fits,
+                                            dataset_metadata.feature_names),
+               args.output_folder / f'plug_in_coverage_fits{args.output_name_suffix}.pt')
