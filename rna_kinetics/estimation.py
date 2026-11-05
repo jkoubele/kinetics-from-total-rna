@@ -1,6 +1,5 @@
 from dataclasses import dataclass
-from enum import StrEnum
-from typing import Callable, Iterator, NamedTuple, Optional, OrderedDict
+from typing import Callable, Iterator, NamedTuple, Optional, OrderedDict, Sequence
 
 import numpy as np
 import pandas as pd
@@ -13,7 +12,9 @@ from torch.func import functional_call, hessian
 from rna_kinetics.data import GeneData, IntronData, DatasetMetadata, GlobalGeneData
 from rna_kinetics.models import RNAKineticsLoss, RNAKineticsModel, TestedRatio, LRTSpecification, \
     IntronCoverageModel, CoverageLoss, GlobalRNAKineticsModel, RATIO_AS_LFC_COMBINATION, \
-    GLOBAL_MODEL_TESTED_RATIOS, LFCCombination, LFCParameter
+    GLOBAL_MODEL_TESTED_RATIOS, GLOBAL_PLUG_IN_TESTABLE_RATIOS, PLUG_IN_TESTABLE_RATIOS, \
+    LFCCombination, LFCParameter, CoverageFitStatus, PlugInCoverage, PlugInCoverageFit, \
+    PlugInCoverageFits
 
 LOSS_CLAMP_VALUE = 1e30
 
@@ -34,65 +35,6 @@ class CacheForRegularization:
     training_input_per_gene: list[tuple[GeneData, StateDict]]
     dataset_metadata: DatasetMetadata
     intron_specific_lfc: Optional[bool] = None  # RNAKineticsModel only: LFC parameter shape
-
-
-class CoverageFitStatus(StrEnum):
-    """
-    Whether one intron's coverage fit can be used as a plug-in value.
-
-    Single-valued, with `training_diverged` taking precedence over `not_estimable`, because the
-    only question a consumer asks is whether the fit is usable. The individual diagnostics stay in
-    `model_parameters.tsv`, which reports the divergence flag and the Wald columns separately.
-    """
-    OK = 'ok'
-    TRAINING_DIVERGED = 'training_diverged'
-    NOT_ESTIMABLE = 'not_estimable'
-
-
-@dataclass
-class PlugInCoverageFit:
-    """
-    One `IntronCoverageModel` fit, in the form a plug-in estimator consumes.
-
-    A plug-in stage two freezes a whole coverage fit at once, so the variance correction needs the
-    joint covariance of everything that fit estimated: one `lfc_elong_over_splice` together with
-    the intercepts of every intron it was fitted over. The three granularities of the coverage
-    model differ only in the length of `intron_names`, which is one intron, a gene's introns, or
-    the whole dataset's.
-
-    `lfc_elong_over_splice` is (num_features,), shared across `intron_names`, and
-    `intercept_pi_logit` is (num_introns,). Both also appear in `model_parameters.tsv`; they are
-    carried here so that the artifact stands on its own and a consumer needs no join against a
-    published table.
-
-    `covariance` is the inverse Fisher information over those same values, in that order, so it is
-    square of side `num_features + num_introns`. It is the one quantity the TSVs have no column
-    for, which is the reason this artifact exists: `model_parameters.tsv` reports only its
-    diagonal, as `SE`. None when there is no covariance to report, which `status` then explains.
-    """
-    intron_names: list[str]
-    lfc_elong_over_splice: torch.Tensor  # (num_features,)
-    intercept_pi_logit: torch.Tensor  # (num_introns,)
-    covariance: Optional[torch.Tensor]  # (num_features + num_introns) square, or None
-    status: CoverageFitStatus
-
-
-@dataclass
-class PlugInCoverageFits:
-    """
-    The coverage fits of one chunk, pickled via `torch.save` for a later process.
-
-    A wire format, so the field names cross a process boundary. Chunks merge by concatenating
-    `fits`. `feature_names` describes the design, which every fit in the chunk shares and which is
-    what makes the covariance axes readable on the far side; `intron_names` describes a single fit
-    and so sits on it.
-
-    `is_regularized` says these came from the penalized refit, whose fits carry no covariance: the
-    Hessian of a penalized objective is not an information matrix.
-    """
-    fits: list[PlugInCoverageFit]
-    feature_names: list[str]
-    is_regularized: bool = False
 
 
 class ModelFitResults(NamedTuple):
@@ -259,6 +201,9 @@ def absorb_read_class_shifts(model_to_adjust: nn.Module,
     exactly: the exon class sits under intercept_exon alone, the nascent class under
     intercept_unspliced + intercept_pi_logit, and the unspliced class under intercept_unspliced,
     so shifting the unspliced class also needs intercept_pi_logit to keep the nascent class put.
+    Under the plug-in that last move is both forbidden and unnecessary: the two intron classes
+    shift together by construction, so the correction is zero up to rounding, and writing it would
+    drift the value the coverage fit supplied.
 
     The shift is measured rather than derived per tested ratio, which keeps one rule for all six
     and lets this serve both directions -- hot starting a reduced model from the full fit, and
@@ -279,7 +224,8 @@ def absorb_read_class_shifts(model_to_adjust: nn.Module,
 
         model_to_adjust.intercept_exon -= shift_exon
         model_to_adjust.intercept_unspliced -= shift_unspliced
-        model_to_adjust.intercept_pi_logit += shift_unspliced - shift_nascent
+        if not model_to_adjust.coverage_is_plugged_in:
+            model_to_adjust.intercept_pi_logit += shift_unspliced - shift_nascent
 
 
 def absorb_coverage_model_shift(model_to_adjust: IntronCoverageModel,
@@ -384,8 +330,9 @@ def set_full_rna_kinetics_model_from_reduced(model_full: nn.Module,
         model_full.lfc_init_over_deg.copy_(lfc_init_over_deg)
         model_full.lfc_splice_over_deg.copy_(
             init_over_deg_per_intron - get_projection_onto_design(design_matrix, unspliced_term))
-        model_full.lfc_elong_over_splice.copy_(
-            get_projection_onto_design(design_matrix, unspliced_term - nascent_term))
+        if not model_full.coverage_is_plugged_in:
+            model_full.lfc_elong_over_splice.copy_(
+                get_projection_onto_design(design_matrix, unspliced_term - nascent_term))
     absorb_read_class_shifts(model_full, model_reduced, design_matrix, reduced_design_matrix)
 
 
@@ -408,8 +355,9 @@ def set_full_global_rna_kinetics_model_from_reduced(model_full: nn.Module,
         init_over_deg_per_intron = exon_term[:, model_reduced.gene_idx]
         model_full.lfc_splice_over_deg.copy_(get_projection_onto_design(
             design_matrix, (init_over_deg_per_intron - unspliced_term).mean(dim=1)))
-        model_full.lfc_elong_over_splice.copy_(get_projection_onto_design(
-            design_matrix, (unspliced_term - nascent_term).mean(dim=1)))
+        if not model_full.coverage_is_plugged_in:
+            model_full.lfc_elong_over_splice.copy_(get_projection_onto_design(
+                design_matrix, (unspliced_term - nascent_term).mean(dim=1)))
     absorb_read_class_shifts(model_full, model_reduced, design_matrix, reduced_design_matrix)
 
 
@@ -949,12 +897,18 @@ def get_contrast_of_ratio(model: nn.Module,
 
     `model` has to be the full model. A reduced one holds the tested ratio in `reduced_lfc`, which
     has neither a row in the parameter dataframe nor a standard error to report.
+
+    A plugged-in LFC has no row either, being a buffer rather than a parameter, so it drops out
+    of the contrast the same way an absent design column does. The standard error that comes back
+    is then the one conditional on the plugged-in value, which understates the uncertainty until
+    the stage-one variance is added back. A contrast left with no rows at all -- the plugged-in
+    ratio itself -- is reported as not identifiable rather than as a standard error of zero.
     """
     model_parameters = dict(model.named_parameters())
     parameter_offsets = get_flat_parameter_offsets(model_parameters)
 
     def get_row(lfc_attribute: str, column_name) -> Optional[int]:
-        if pd.isna(column_name):
+        if pd.isna(column_name) or lfc_attribute not in model_parameters:
             return None
         lfc = model_parameters[lfc_attribute]
         feature_index = model.feature_names.index(column_name)
@@ -984,12 +938,16 @@ def get_contrast_wald_results(parameter_covariance: Optional[ParameterCovariance
     that parameter in the parameter table. A contrast touching an unidentifiable parameter has no
     standard error at all and is reported as not identifiable, which is the conservative reading
     when the ratio combines two parameters and only one of them is identifiable.
+
+    An empty contrast is reported the same way. It is what a ratio built entirely from plugged-in
+    values comes to, and this Fisher information genuinely has nothing to say about it; a
+    standard error of zero would instead say it was known exactly.
     """
     not_identifiable = {'lfc_se': np.nan,
                         'z_score': np.nan,
                         'p_value_wald': np.nan,
                         'lfc_identifiable': False}
-    if parameter_covariance is None:
+    if parameter_covariance is None or not contrast:
         return not_identifiable
 
     position_in_covariance = {row: position
@@ -1162,16 +1120,22 @@ def fit_full_and_reduced_models(
 
 
 def _iter_reported_ratios(intron_names: list[str],
-                          intron_specific_lfc: bool
+                          intron_specific_lfc: bool,
+                          tested_ratios: Sequence[TestedRatio] = tuple(TestedRatio)
                           ) -> Iterator[tuple[TestedRatio, Optional[str], int]]:
     """
-    Every (ratio, intron) combination the per-gene model reports, with the intron's index.
+    Every (ratio, intron) combination to report, with the intron's index.
 
     Every ratio except init/deg involves elongation or splicing, so it is reported one intron at a
     time whenever those LFCs are intron-specific. Shared by the LRT enumeration and the
-    `ratio_lfcs` table so the two cannot describe different sets of ratios.
+    `ratio_lfcs` table, which pass the same `tested_ratios` wherever they cover the same set.
+
+    They do not under the plug-in: `ratio_lfcs` reports an effect size for all six ratios,
+    elong/splice included, since the plugged-in value is a perfectly good estimate of it, while
+    the LRT enumeration passes PLUG_IN_TESTABLE_RATIOS because that one ratio has no reduced model
+    here. Its test comes from the coverage fit instead.
     """
-    for tested_ratio in TestedRatio:
+    for tested_ratio in tested_ratios:
         if intron_specific_lfc and tested_ratio != TestedRatio.INIT_OVER_DEG:
             yield from ((tested_ratio, intron_name, intron_index)
                         for intron_index, intron_name in enumerate(intron_names))
@@ -1189,17 +1153,41 @@ def _get_tested_intron_index(gene_data: GeneData, lrt_specification: LRTSpecific
 def get_rna_kinetics_model_results(gene_data: GeneData,
                                    dataset_metadata: DatasetMetadata,
                                    intron_specific_lfc: bool,
+                                   plug_in_coverage_fits: Optional[list[PlugInCoverageFit]] = None,
                                    device='cpu'
                                    ) -> ModelFitResults:
+    """
+    Fit the per-gene model and run every likelihood ratio test it supports.
+
+    Given `plug_in_coverage_fits`, lfc_elong_over_splice and the pi intercepts are taken from
+    those coverage fits rather than estimated here, and the model reduces to the count arm alone.
+    One fit per intron is needed where the LFCs are intron-specific and a single fit covering the
+    gene otherwise; `PlugInCoverage.from_fits` is where that is checked. Five of the six ratios
+    are then tested as usual and elong/splice is not, its test being the coverage fit's own.
+
+    The standard errors reported under the plug-in are conditional on the plugged-in values, so
+    they understate the uncertainty until the variance correction is applied downstream.
+    """
     gene_data = gene_data.to(device)
     dataset_metadata = dataset_metadata.to(device)
+
+    plug_in_coverage: Optional[PlugInCoverage] = None
+    if plug_in_coverage_fits is not None:
+        plug_in_coverage = PlugInCoverage.from_fits(plug_in_coverage_fits,
+                                                    gene_data.intron_names,
+                                                    intron_specific_lfc)
+        plug_in_coverage = PlugInCoverage(
+            *(value.to(device) for value in plug_in_coverage))
+    tested_ratios = (PLUG_IN_TESTABLE_RATIOS if plug_in_coverage is not None
+                     else tuple(TestedRatio))
 
     # Enumerated up front so the reduced models can be indexed by position by the restart loop.
     lrt_inputs: list[LRTInputs] = []
     for _, lrt_metadata_row in dataset_metadata.lrt_metadata.iterrows():
         reduced_design_matrix = dataset_metadata.reduced_matrices[lrt_metadata_row['test_id']]
         for tested_ratio, intron_name, _ in _iter_reported_ratios(gene_data.intron_names,
-                                                                  intron_specific_lfc):
+                                                                  intron_specific_lfc,
+                                                                  tested_ratios):
             lrt_inputs.append(LRTInputs(
                 lrt_metadata_row=lrt_metadata_row,
                 reduced_design_matrix=reduced_design_matrix,
@@ -1211,7 +1199,8 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
     def build_full_model() -> RNAKineticsModel:
         return RNAKineticsModel(feature_names=dataset_metadata.feature_names,
                                 intron_names=gene_data.intron_names,
-                                intron_specific_lfc=intron_specific_lfc).to(device)
+                                intron_specific_lfc=intron_specific_lfc,
+                                plug_in_coverage=plug_in_coverage).to(device)
 
     def fit(model: RNAKineticsModel,
             reduced_design_matrix: Optional[torch.Tensor]) -> tuple[RNAKineticsModel,
@@ -1234,7 +1223,8 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
             feature_names=dataset_metadata.feature_names,
             intron_names=gene_data.intron_names,
             intron_specific_lfc=intron_specific_lfc,
-            lrt_specification=lrt_input.lrt_specification).to(device)
+            lrt_specification=lrt_input.lrt_specification,
+            plug_in_coverage=plug_in_coverage).to(device)
 
         set_reduced_rna_kinetics_model_from_full(
             model_reduced, model_full, dataset_metadata.design_matrix,
@@ -1626,17 +1616,36 @@ def _train_two_stage(
 def get_global_rna_kinetics_model_results(
         global_gene_data: GlobalGeneData,
         dataset_metadata: DatasetMetadata,
+        plug_in_coverage_fits: Optional[list[PlugInCoverageFit]] = None,
         device: str = 'cpu',
         verbose: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Fit the genome-wide model and run every likelihood ratio test it supports.
+
+    Given `plug_in_coverage_fits`, lfc_elong_over_splice and the pi intercepts come from the
+    coverage fits covering this dataset's introns rather than from here. The LFC is shared across
+    the whole dataset, so a single fit over all of them is what this takes, and of the three
+    ratios the model can test only two are left: elong/splice is the coverage fit's own test.
+    """
     global_gene_data = global_gene_data.to(device)
     dataset_metadata = dataset_metadata.to(device)
     feature_names = dataset_metadata.feature_names
 
+    plug_in_coverage: Optional[PlugInCoverage] = None
+    if plug_in_coverage_fits is not None:
+        plug_in_coverage = PlugInCoverage.from_fits(plug_in_coverage_fits,
+                                                    global_gene_data.intron_names,
+                                                    intron_specific_lfc=False)
+        plug_in_coverage = PlugInCoverage(
+            *(value.to(device) for value in plug_in_coverage))
+    tested_ratios = (GLOBAL_PLUG_IN_TESTABLE_RATIOS if plug_in_coverage is not None
+                     else GLOBAL_MODEL_TESTED_RATIOS)
+
     lrt_inputs: list[LRTInputs] = []
     for _, lrt_row in dataset_metadata.lrt_metadata.iterrows():
         reduced_matrix = dataset_metadata.reduced_matrices[lrt_row['test_id']]
-        for tested_ratio in GLOBAL_MODEL_TESTED_RATIOS:
+        for tested_ratio in tested_ratios:
             lrt_inputs.append(LRTInputs(
                 lrt_metadata_row=lrt_row,
                 reduced_design_matrix=reduced_matrix,
@@ -1651,11 +1660,15 @@ def get_global_rna_kinetics_model_results(
             intron_names=global_gene_data.intron_names,
             gene_idx=global_gene_data.gene_idx,
             lrt_specification=lrt_specification,
+            plug_in_coverage=plug_in_coverage,
         ).to(device)
 
     def fit(model: GlobalRNAKineticsModel,
             reduced_matrix: Optional[torch.Tensor],
             label: str) -> tuple[GlobalRNAKineticsModel, TrainingResults]:
+        # Named rather than selected, so a plugged-in lfc_elong_over_splice simply is not among
+        # the model's parameters and the first stage optimizes what is left. The staging is then
+        # redundant, the plug-in objective being convex, but it costs one extra warm start.
         global_param_names = {LFCParameter.ELONG_OVER_SPLICE, LFCParameter.SPLICE_OVER_DEG}
         if reduced_matrix is not None:
             global_param_names = global_param_names | {'reduced_lfc'}

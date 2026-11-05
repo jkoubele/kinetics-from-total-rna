@@ -1,4 +1,5 @@
 import itertools
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Optional, NamedTuple
 
@@ -7,6 +8,7 @@ import pandas as pd
 import statsmodels.api as sm
 import torch
 import torch.nn as nn
+import torch.nn.functional as functional
 
 from rna_kinetics.data import GeneData, GlobalGeneData
 
@@ -88,6 +90,145 @@ RATIO_AS_LFC_COMBINATION: dict[TestedRatio, LFCCombination] = {
 GLOBAL_MODEL_TESTED_RATIOS = (TestedRatio.ELONG_OVER_DEG,
                               TestedRatio.SPLICE_OVER_DEG,
                               TestedRatio.ELONG_OVER_SPLICE)
+
+
+# A plug-in RNAKineticsModel takes lfc_elong_over_splice from a coverage fit instead of fitting
+# it, so restricting that one ratio is no longer a restriction on anything the model is free to
+# move. Its test is the coverage model's own LRT, which that fit already reports.
+PLUG_IN_TESTABLE_RATIOS = tuple(tested_ratio for tested_ratio in TestedRatio
+                                if tested_ratio != TestedRatio.ELONG_OVER_SPLICE)
+GLOBAL_PLUG_IN_TESTABLE_RATIOS = tuple(tested_ratio for tested_ratio in GLOBAL_MODEL_TESTED_RATIOS
+                                       if tested_ratio in PLUG_IN_TESTABLE_RATIOS)
+
+
+class CoverageFitStatus(StrEnum):
+    """
+    Whether one intron's coverage fit can be used as a plug-in value.
+
+    Single-valued, with `training_diverged` taking precedence over `not_estimable`, because the
+    only question a consumer asks is whether the fit is usable. The individual diagnostics stay in
+    `model_parameters.tsv`, which reports the divergence flag and the Wald columns separately.
+    """
+    OK = 'ok'
+    TRAINING_DIVERGED = 'training_diverged'
+    NOT_ESTIMABLE = 'not_estimable'
+
+
+@dataclass
+class PlugInCoverageFit:
+    """
+    One `IntronCoverageModel` fit, in the form a plug-in estimator consumes.
+
+    A plug-in stage two freezes a whole coverage fit at once, so the variance correction needs the
+    joint covariance of everything that fit estimated: one `lfc_elong_over_splice` together with
+    the intercepts of every intron it was fitted over. The three granularities of the coverage
+    model differ only in the length of `intron_names`, which is one intron, a gene's introns, or
+    the whole dataset's.
+
+    `lfc_elong_over_splice` is (num_features,), shared across `intron_names`, and
+    `intercept_pi_logit` is (num_introns,). Both also appear in `model_parameters.tsv`; they are
+    carried here so that the artifact stands on its own and a consumer needs no join against a
+    published table.
+
+    `covariance` is the inverse Fisher information over those same values, in that order, so it is
+    square of side `num_features + num_introns`. It is the one quantity the TSVs have no column
+    for, which is the reason this artifact exists: `model_parameters.tsv` reports only its
+    diagonal, as `SE`. None when there is no covariance to report, which `status` then explains.
+    """
+    intron_names: list[str]
+    lfc_elong_over_splice: torch.Tensor  # (num_features,)
+    intercept_pi_logit: torch.Tensor  # (num_introns,)
+    covariance: Optional[torch.Tensor]  # (num_features + num_introns) square, or None
+    status: CoverageFitStatus
+
+
+@dataclass
+class PlugInCoverageFits:
+    """
+    The coverage fits of one chunk, pickled via `torch.save` for a later process.
+
+    A wire format, so the field names cross a process boundary. Chunks merge by concatenating
+    `fits`. `feature_names` describes the design, which every fit in the chunk shares and which is
+    what makes the covariance axes readable on the far side; `intron_names` describes a single fit
+    and so sits on it.
+
+    `is_regularized` says these came from the penalized refit, whose fits carry no covariance: the
+    Hessian of a penalized objective is not an information matrix.
+    """
+    fits: list[PlugInCoverageFit]
+    feature_names: list[str]
+    is_regularized: bool = False
+
+
+class PlugInCoverage(NamedTuple):
+    """
+    The coverage fit's values laid out the way the model that plugs them in holds them.
+
+    `lfc_elong_over_splice` is (num_features, num_introns) where the model's own LFC would be
+    intron-specific and (num_features, 1) where it would be shared, and `intercept_pi_logit` is
+    (num_introns,) in the model's intron order. Built by `from_fits`, which is where the fits'
+    intron names are matched against the model's.
+    """
+    lfc_elong_over_splice: torch.Tensor
+    intercept_pi_logit: torch.Tensor
+
+    def check_shapes(self, lfc_shape: tuple[int, ...], num_introns: int) -> None:
+        """Refuse a layout built for a different model than the one plugging it in."""
+        if tuple(self.lfc_elong_over_splice.shape) != lfc_shape:
+            raise ValueError(
+                f'Plugged-in lfc_elong_over_splice has shape '
+                f'{tuple(self.lfc_elong_over_splice.shape)}, expected {lfc_shape}.')
+        if tuple(self.intercept_pi_logit.shape) != (num_introns,):
+            raise ValueError(
+                f'Plugged-in intercept_pi_logit has shape '
+                f'{tuple(self.intercept_pi_logit.shape)}, expected {(num_introns,)}.')
+
+    @staticmethod
+    def from_fits(fits: list[PlugInCoverageFit],
+                  intron_names: list[str],
+                  intron_specific_lfc: bool) -> 'PlugInCoverage':
+        """
+        Lay out the coverage fits covering `intron_names`, in that order.
+
+        An intron-specific LFC needs its own value per intron and so one fit per intron, while a
+        shared one needs a single fit that covers them all. Which of the two is being built is
+        read off `intron_specific_lfc` rather than off the number of fits, so a gene whose introns
+        happen to number one cannot be served the wrong layout.
+
+        Every intron of the model must appear in the fits, and a fit covering introns the model
+        does not hold is accepted: a genome-wide coverage fit serves every gene.
+        """
+        fit_of_intron: dict[str, PlugInCoverageFit] = {}
+        for fit in fits:
+            for intron_name in fit.intron_names:
+                fit_of_intron[intron_name] = fit
+
+        missing = [intron_name for intron_name in intron_names if intron_name not in fit_of_intron]
+        if missing:
+            raise ValueError(f'No coverage fit covers introns {missing}.')
+
+        intercept_pi_logit = torch.stack([
+            fit_of_intron[intron_name].intercept_pi_logit[
+                fit_of_intron[intron_name].intron_names.index(intron_name)]
+            for intron_name in intron_names])
+
+        if intron_specific_lfc:
+            lfc_columns = [fit_of_intron[intron_name].lfc_elong_over_splice
+                           for intron_name in intron_names]
+            lfc_elong_over_splice = torch.stack(lfc_columns, dim=1)
+        else:
+            # Shared across the model's introns, so every one of them has to come from the same
+            # fit; otherwise the values being plugged in are not a single shared LFC at all.
+            distinct_fits = {id(fit_of_intron[intron_name]) for intron_name in intron_names}
+            if len(distinct_fits) > 1:
+                raise ValueError(
+                    f'lfc_elong_over_splice is shared across {len(intron_names)} introns, so they '
+                    f'must come from one coverage fit, but they come from {len(distinct_fits)}.')
+            lfc_elong_over_splice = fit_of_intron[
+                intron_names[0]].lfc_elong_over_splice.unsqueeze(1)
+
+        return PlugInCoverage(lfc_elong_over_splice=lfc_elong_over_splice,
+                              intercept_pi_logit=intercept_pi_logit)
 
 
 class LRTSpecification(NamedTuple):
@@ -231,13 +372,60 @@ def estimate_initial_pi(coverage: torch.Tensor,
         return pi_grid[coverage_loss_grid.argmin(dim=0)]
 
 
+def _get_predicted_pi_from_read_classes(intercept_pi_logit: torch.Tensor,
+                                        lfc_term_nascent: torch.Tensor,
+                                        lfc_term_unspliced: torch.Tensor,
+                                        coverage_is_plugged_in: bool) -> Optional[torch.Tensor]:
+    """
+    The nascent fraction the two intron read classes imply, or None under the plug-in.
+
+    For the two RNA kinetics models only, which is what taking the read-class terms as arguments
+    says: pi is not an independent quantity there, and deriving it from the same two terms that
+    build the counts is what keeps the coverage loss and the Poisson count loss fitting one pi
+    under every null. `IntronCoverageModel` has no read classes and builds the same pi straight
+    from its own two parameters. That the two routes give the same quantity is what a plug-in
+    estimator rests on, so neither should be changed without the other.
+
+    With the coverage plugged in the two terms differ by a frozen lfc_elong_over_splice, so pi is
+    whatever the coverage fit said and carries no gradient. Nothing is returned then, which keeps
+    the coverage loss out of the graph rather than leaving it to add a constant.
+    """
+    if coverage_is_plugged_in:
+        return None
+    return torch.sigmoid(intercept_pi_logit + lfc_term_nascent - lfc_term_unspliced)
+
+
+def _link_unspliced_to_nascent(unspliced_term: torch.Tensor,
+                               nascent_term: torch.Tensor,
+                               elong_over_splice_term: torch.Tensor,
+                               coverage_is_plugged_in: bool) -> torch.Tensor:
+    """
+    The unspliced read class's term, consistent with the nascent one under the plug-in.
+
+    For the two RNA kinetics models only, read classes being theirs alone.
+
+    A frozen lfc_elong_over_splice pins the two intron read classes to each other, so a reduced
+    model may restrict only one of them and the other follows. The restrictions that rebuild the
+    unspliced class already derive the nascent one from it and this returns their input unchanged;
+    the ones that rebuild the nascent class leave the unspliced class at its unrestricted value,
+    and this is where the restriction propagates back into it.
+
+    Without the plug-in all three read classes are free to move independently, and rebuilding one
+    of them says nothing about the others, so the term is returned as the branches built it.
+    """
+    if not coverage_is_plugged_in:
+        return unspliced_term
+    return nascent_term + elong_over_splice_term
+
+
 class RNAKineticsModel(nn.Module):
 
     def __init__(self,
                  feature_names: list[str],
                  intron_names: list[str],
                  intron_specific_lfc: bool,
-                 lrt_specification: Optional[LRTSpecification] = None
+                 lrt_specification: Optional[LRTSpecification] = None,
+                 plug_in_coverage: Optional[PlugInCoverage] = None
                  ):
         super().__init__()
         self.feature_names = feature_names
@@ -245,24 +433,46 @@ class RNAKineticsModel(nn.Module):
 
         num_features = len(feature_names)
         num_introns = len(intron_names)
+        lfc_intron_axis = num_introns if intron_specific_lfc else 1
+
+        # Given a coverage fit, lfc_elong_over_splice and intercept_pi_logit are that fit's values
+        # rather than anything this model estimates, so they become buffers. That alone is what
+        # makes this a plug-in model: leaving named_parameters() takes them out of the gradient,
+        # the Fisher information, the parameter table and the prior penalty at once, none of which
+        # has to know the difference. Registration order is unchanged either way, because the
+        # remaining parameters keep the row order the Fisher information indexes them by.
+        self.coverage_is_plugged_in = plug_in_coverage is not None
+        if plug_in_coverage is not None:
+            plug_in_coverage.check_shapes((num_features, lfc_intron_axis), num_introns)
 
         self.lfc_init_over_deg = nn.Parameter(torch.zeros(num_features))
         self.intercept_exon = nn.Parameter(torch.zeros(1))
 
-        if intron_specific_lfc:
-            self.lfc_elong_over_splice = nn.Parameter(torch.zeros(num_features, num_introns))
-            self.lfc_splice_over_deg = nn.Parameter(torch.zeros(num_features, num_introns))
+        if plug_in_coverage is None:
+            self.lfc_elong_over_splice = nn.Parameter(torch.zeros(num_features, lfc_intron_axis))
         else:
-            self.lfc_elong_over_splice = nn.Parameter(torch.zeros(num_features, 1))
-            self.lfc_splice_over_deg = nn.Parameter(torch.zeros(num_features, 1))
+            self.register_buffer('lfc_elong_over_splice',
+                                 plug_in_coverage.lfc_elong_over_splice.clone())
+        self.lfc_splice_over_deg = nn.Parameter(torch.zeros(num_features, lfc_intron_axis))
         self.intron_specific_lfc = intron_specific_lfc
 
         self.intercept_unspliced = nn.Parameter(torch.zeros(num_introns))
-        self.intercept_pi_logit = nn.Parameter(torch.zeros(num_introns))
+        if plug_in_coverage is None:
+            self.intercept_pi_logit = nn.Parameter(torch.zeros(num_introns))
+        else:
+            self.register_buffer('intercept_pi_logit',
+                                 plug_in_coverage.intercept_pi_logit.clone())
 
         self.lrt_specification = lrt_specification
         self.tested_intron_index: Optional[int] = None
         if lrt_specification is not None:
+            if (self.coverage_is_plugged_in
+                    and lrt_specification.tested_ratio not in PLUG_IN_TESTABLE_RATIOS):
+                raise ValueError(
+                    f'A plug-in RNAKineticsModel LRT supports only {PLUG_IN_TESTABLE_RATIOS}, '
+                    f'got {lrt_specification.tested_ratio!r}: that ratio comes from the coverage '
+                    f'fit rather than being estimated here, so restricting it restricts nothing '
+                    f'the model is free to move, and its test is the coverage model\'s own.')
             self.reduced_lfc = nn.Parameter(torch.zeros(lrt_specification.num_features_reduced_matrix))
             # Every ratio except init/deg involves elongation or splicing, whose LFCs can be
             # intron-specific, so those are tested one intron at a time. init/deg involves only
@@ -286,12 +496,20 @@ class RNAKineticsModel(nn.Module):
             glm_lfc = _fit_poisson_glm(design_matrix.cpu().numpy(), gene_data.exon_reads.cpu().numpy(), offset)
             self.lfc_init_over_deg.data.copy_(torch.from_numpy(glm_lfc).to(self.lfc_init_over_deg.dtype))
 
-            best_pi = estimate_initial_pi(gene_data.coverage, pi_eps, num_pi_grid_points)
-            self.intercept_pi_logit.data.copy_(torch.logit(best_pi, eps=pi_eps))
-
-            intercept_unspliced_vector = torch.log(
-                gene_data.intron_reads.mean(dim=0) / library_sizes.mean() * (1 - best_pi))
-            self.intercept_unspliced.data.copy_(intercept_unspliced_vector)
+            # The unspliced intercept has to sit under the pi the model will actually use,
+            # since the two intron read classes sum to the observed counts only at that pi. A
+            # plugged-in intercept_pi_logit is therefore read rather than grid searched, and
+            # log(1 - pi) is taken as -softplus(logit) so that a saturated one stays finite: at
+            # logit 1055 softplus returns 1055, while log1p(-sigmoid(1055)) is -inf.
+            mean_intron_reads = gene_data.intron_reads.mean(dim=0) / library_sizes.mean()
+            if self.coverage_is_plugged_in:
+                self.intercept_unspliced.data.copy_(
+                    torch.log(mean_intron_reads)
+                    - functional.softplus(self.intercept_pi_logit))
+            else:
+                best_pi = estimate_initial_pi(gene_data.coverage, pi_eps, num_pi_grid_points)
+                self.intercept_pi_logit.data.copy_(torch.logit(best_pi, eps=pi_eps))
+                self.intercept_unspliced.data.copy_(torch.log(mean_intron_reads * (1 - best_pi)))
 
     def get_lfc_terms_per_read_class(self,
                                      design_matrix: torch.Tensor,
@@ -378,6 +596,9 @@ class RNAKineticsModel(nn.Module):
         else:
             raise ValueError(f'Unhandled tested ratio: {tested_ratio!r}')
 
+        unspliced_term = _link_unspliced_to_nascent(unspliced_term, nascent_term,
+                                                    elong_over_splice_term,
+                                                    self.coverage_is_plugged_in)
         return init_over_deg_term, nascent_term, unspliced_term
 
     def _get_tested_intron_column(self, full_term: torch.Tensor) -> torch.Tensor:
@@ -419,11 +640,9 @@ class RNAKineticsModel(nn.Module):
         predicted_log_reads_exon = (self.intercept_exon + log_library_sizes
                                     + isoform_length_offset + lfc_term_exon)
 
-        # pi is not an independent quantity: it is the nascent fraction implied by the two intron
-        # read classes. Deriving it from the same two terms that build the counts is what keeps
-        # the coverage loss and the Poisson count loss fitting one pi under every null.
-        predicted_pi = torch.sigmoid(
-            self.intercept_pi_logit + lfc_term_nascent - lfc_term_unspliced)
+        predicted_pi = _get_predicted_pi_from_read_classes(
+            self.intercept_pi_logit, lfc_term_nascent, lfc_term_unspliced,
+            self.coverage_is_plugged_in)
 
         # The two intron read classes share the library-size offset and differ in their
         # intercept. Naming the nascent intercept makes intercept_pi_logit's role explicit: it is
@@ -506,6 +725,7 @@ class GlobalRNAKineticsModel(nn.Module):
                  intron_names: list[str],
                  gene_idx: torch.Tensor,
                  lrt_specification: Optional[LRTSpecification] = None,
+                 plug_in_coverage: Optional[PlugInCoverage] = None,
                  ):
         super().__init__()
         self.feature_names = feature_names
@@ -516,20 +736,39 @@ class GlobalRNAKineticsModel(nn.Module):
         num_genes = len(gene_names)
         num_introns = len(intron_names)
 
+        # As in RNAKineticsModel: a coverage fit turns these two into buffers, and that is the
+        # whole of what makes the model a plug-in one. The LFC is shared across the dataset here,
+        # so it has no intron axis to lay out and is stored as (num_features,).
+        self.coverage_is_plugged_in = plug_in_coverage is not None
+        if plug_in_coverage is not None:
+            plug_in_coverage.check_shapes((num_features, 1), num_introns)
+
         self.lfc_init_over_deg = nn.Parameter(torch.zeros(num_genes, num_features))
-        self.lfc_elong_over_splice = nn.Parameter(torch.zeros(num_features))
+        if plug_in_coverage is None:
+            self.lfc_elong_over_splice = nn.Parameter(torch.zeros(num_features))
+        else:
+            self.register_buffer('lfc_elong_over_splice',
+                                 plug_in_coverage.lfc_elong_over_splice[:, 0].clone())
         self.lfc_splice_over_deg = nn.Parameter(torch.zeros(num_features))
         self.intercept_exon = nn.Parameter(torch.zeros(num_genes))
         self.intercept_unspliced = nn.Parameter(torch.zeros(num_introns))
-        self.intercept_pi_logit = nn.Parameter(torch.zeros(num_introns))
+        if plug_in_coverage is None:
+            self.intercept_pi_logit = nn.Parameter(torch.zeros(num_introns))
+        else:
+            self.register_buffer('intercept_pi_logit',
+                                 plug_in_coverage.intercept_pi_logit.clone())
 
         self.register_buffer('gene_idx', gene_idx)
 
         self.lrt_specification = lrt_specification
         if lrt_specification is not None:
-            if lrt_specification.tested_ratio not in GLOBAL_MODEL_TESTED_RATIOS:
+            # A plugged-in lfc_elong_over_splice leaves two of the three testable, its own test
+            # being the coverage model's.
+            testable_ratios = (GLOBAL_PLUG_IN_TESTABLE_RATIOS if self.coverage_is_plugged_in
+                               else GLOBAL_MODEL_TESTED_RATIOS)
+            if lrt_specification.tested_ratio not in testable_ratios:
                 raise ValueError(
-                    f"GlobalRNAKineticsModel LRT supports only {GLOBAL_MODEL_TESTED_RATIOS}, "
+                    f"GlobalRNAKineticsModel LRT supports only {testable_ratios}, "
                     f"got {lrt_specification.tested_ratio!r}.")
             self.reduced_lfc = nn.Parameter(torch.zeros(lrt_specification.num_features_reduced_matrix))
 
@@ -552,12 +791,18 @@ class GlobalRNAKineticsModel(nn.Module):
             )  # (num_genes, num_features)
             self.lfc_init_over_deg.data.copy_(torch.from_numpy(glm_lfc).to(self.lfc_init_over_deg.dtype))
 
-            best_pi = estimate_initial_pi(global_gene_data.coverage, pi_eps, num_pi_grid_points)
-            self.intercept_pi_logit.data.copy_(torch.logit(best_pi, eps=pi_eps))
-
-            self.intercept_unspliced.data.copy_(
-                torch.log(global_gene_data.intron_reads.mean(dim=0) / library_sizes.mean() * (1 - best_pi))
-            )
+            # See RNAKineticsModel.initialize_parameters: the unspliced intercept sits under
+            # whichever pi the model will use, and -softplus(logit) is log(1 - pi) written so that
+            # a saturated plugged-in logit stays finite.
+            mean_intron_reads = global_gene_data.intron_reads.mean(dim=0) / library_sizes.mean()
+            if self.coverage_is_plugged_in:
+                self.intercept_unspliced.data.copy_(
+                    torch.log(mean_intron_reads) - functional.softplus(self.intercept_pi_logit))
+            else:
+                best_pi = estimate_initial_pi(global_gene_data.coverage, pi_eps,
+                                              num_pi_grid_points)
+                self.intercept_pi_logit.data.copy_(torch.logit(best_pi, eps=pi_eps))
+                self.intercept_unspliced.data.copy_(torch.log(mean_intron_reads * (1 - best_pi)))
 
     def get_lfc_terms_per_read_class(self,
                                      design_matrix: torch.Tensor,
@@ -600,6 +845,10 @@ class GlobalRNAKineticsModel(nn.Module):
             else:
                 raise ValueError(f'Unhandled tested ratio: {tested_ratio!r}')
 
+            unspliced_term = _link_unspliced_to_nascent(unspliced_term, nascent_term,
+                                                        elong_over_splice_term,
+                                                        self.coverage_is_plugged_in)
+
         return init_over_deg_term, nascent_term, unspliced_term
 
     def forward(self,
@@ -617,11 +866,9 @@ class GlobalRNAKineticsModel(nn.Module):
                 + lfc_term_exon
         )
 
-        # pi is not an independent quantity: it is the nascent fraction implied by the two intron
-        # read classes. Deriving it from the same two terms that build the counts is what keeps
-        # the coverage loss and the Poisson count loss fitting one pi under every null.
-        predicted_pi = torch.sigmoid(
-            self.intercept_pi_logit + lfc_term_nascent - lfc_term_unspliced)
+        predicted_pi = _get_predicted_pi_from_read_classes(
+            self.intercept_pi_logit, lfc_term_nascent, lfc_term_unspliced,
+            self.coverage_is_plugged_in)
 
         # The two intron read classes share the library-size offset and differ in their
         # intercept. Naming the nascent intercept makes intercept_pi_logit's role explicit: it is
@@ -662,11 +909,20 @@ class RNAKineticsLoss(nn.Module):
                 intron_coverage: torch.Tensor,
                 predicted_reads_exon: torch.Tensor,
                 predicted_reads_intron: torch.Tensor,
-                predicted_pi: torch.Tensor):
+                predicted_pi: Optional[torch.Tensor]):
+        """
+        The three terms of the likelihood, summed.
+
+        A plug-in model predicts no pi, having taken it from a coverage fit, and then the coverage
+        term would be the same constant under every hypothesis. It is left out rather than added,
+        so that the reported loss is the objective that was optimized.
+        """
         loss_exon_counts = self.loss_function_exon_counts(predicted_reads_exon,
                                                           reads_exon)
         loss_intron_counts = self.loss_function_intron_counts(predicted_reads_intron, reads_intron)
-        loss_intron_coverage = self.loss_function_intron_coverage(predicted_pi, intron_coverage)
 
-        total_loss = loss_exon_counts + loss_intron_counts + loss_intron_coverage
+        total_loss = loss_exon_counts + loss_intron_counts
+        if predicted_pi is not None:
+            total_loss = total_loss + self.loss_function_intron_coverage(predicted_pi,
+                                                                         intron_coverage)
         return total_loss
