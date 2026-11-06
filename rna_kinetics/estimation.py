@@ -67,8 +67,8 @@ class RegularizedFitResults(NamedTuple):
     rather than rebuilt downstream from the parameter table, which has no row for the three ratios
     that are not parameters.
 
-    `plug_in_coverage_fit` is set by the coverage models only, and carries no covariance for the
-    same reason `ratio_lfcs` carries no standard errors.
+    `plug_in_coverage_fit` is set by the coverage models only, and carries no Fisher information
+    for the same reason `ratio_lfcs` carries no standard errors.
     """
     model_parameters: pd.DataFrame
     ratio_lfcs: pd.DataFrame
@@ -637,7 +637,7 @@ def get_flat_parameter_offsets(model_parameters: dict[str, torch.Tensor]) -> dic
 
 
 def build_hessian_matrix_from_dict(hessian_dict: dict[str, dict[str, torch.Tensor]],
-                                   model_parameters: dict[str, torch.Tensor]) -> torch.Tensor:
+                                   hessian_variables: dict[str, torch.Tensor]) -> torch.Tensor:
     """
     Assemble the per-parameter-pair Hessian blocks into a single matrix.
 
@@ -646,16 +646,24 @@ def build_hessian_matrix_from_dict(hessian_dict: dict[str, dict[str, torch.Tenso
     to two axes and placed at its offset, which is what the rank-revealing QR and the
     inverse downstream need.
 
+    The matrix carries the variables' own device and dtype, so everything downstream of it reads
+    its precision off the model rather than off the default dtype.
+
     Row/column order is load-bearing: `add_wald_test_results` maps rows of this matrix onto rows
-    of the parameter dataframe by position, so parameters are concatenated in `named_parameters()`
-    order and each block is flattened in C order, matching `build_param_df` in models.py.
+    of the parameter dataframe by position, so the variables are concatenated in
+    `get_hessian_variables` order and each block is flattened in C order, matching
+    `build_param_df` in models.py.
     """
-    param_names = list(model_parameters.keys())
-    param_sizes = {name: model_parameters[name].numel() for name in param_names}
-    param_offsets = get_flat_parameter_offsets(model_parameters)
+    param_names = list(hessian_variables.keys())
+    param_sizes = {name: hessian_variables[name].numel() for name in param_names}
+    param_offsets = get_flat_parameter_offsets(hessian_variables)
     total_param_size = sum(param_sizes.values())
-    device = next(iter(model_parameters.values())).device
-    hessian_matrix = torch.zeros((total_param_size, total_param_size), device=device)
+    # Device and dtype both follow the variables, so a model in double precision gets a Hessian
+    # in double precision. Fixing the dtype here instead would silently round every block down to
+    # the default one on assignment.
+    reference = next(iter(hessian_variables.values()))
+    hessian_matrix = torch.zeros((total_param_size, total_param_size),
+                                 device=reference.device, dtype=reference.dtype)
 
     for param_1 in param_names:
         for param_2 in param_names:
@@ -667,6 +675,36 @@ def build_hessian_matrix_from_dict(hessian_dict: dict[str, dict[str, torch.Tenso
             ] = block
 
     return hessian_matrix
+
+
+# The two values a plug-in model holds as buffers. The count arm still depends on both, so the
+# Hessian is taken over them as well as over the free parameters, which is what gives the mixed
+# block the two-stage variance correction needs.
+PLUG_IN_VALUE_NAMES = (str(LFCParameter.ELONG_OVER_SPLICE), 'intercept_pi_logit')
+
+
+def get_hessian_variables(model: nn.Module) -> dict[str, torch.Tensor]:
+    """
+    The variables the Hessian is taken with respect to, in the order its rows are indexed by.
+
+    These are tensors the model already holds. `torch.func.hessian` differentiates with respect
+    to whatever keys this dict carries, and the loss closure substitutes those same keys back
+    into the model through `functional_call`, which accepts a buffer exactly where it accepts a
+    parameter. A value frozen as a buffer is therefore still differentiable, and this is the one
+    place that says so.
+
+    The free parameters come first, in `named_parameters()` order, so the row order the parameter
+    table and the Wald contrasts rely on is the same whether or not the model is a plug-in one. A
+    plug-in model appends the two values it took from the coverage fit, which the count arm still
+    depends on and which the two-stage correction needs a mixed block over.
+    """
+    values = dict(model.named_parameters())
+    # IntronCoverageModel carries no such flag: it is the model a coverage fit comes from, so
+    # whether coverage is plugged in is not a question about it.
+    if not getattr(model, 'coverage_is_plugged_in', False):
+        return values
+    buffers = dict(model.named_buffers())
+    return values | {name: buffers[name] for name in PLUG_IN_VALUE_NAMES}
 
 
 def get_fisher_information_matrix(model: nn.Module,
@@ -682,10 +720,18 @@ def get_fisher_information_matrix(model: nn.Module,
 
     Everything below this function calls the result a Hessian, everything above it the Fisher
     information.
+
+    For a plug-in model it spans the plugged-in values too (`get_hessian_variables`), and then
+    only the free block is an information matrix: the plugged-in values' own information came from
+    stage one and is carried in the handoff instead. The other two blocks are the count arm's
+    curvature in the plugged-in directions, once against the free parameters and once against
+    themselves. `get_two_stage_parameter_covariance` reads the three apart and uses the first
+    two, the mixed one being how it couples the stages; the plugged-in block itself goes unread,
+    stage one's information taking its place.
     """
-    model_parameters = dict(model.named_parameters())
-    hessian_dict = hessian(loss_fn)(model_parameters)
-    hessian_matrix = build_hessian_matrix_from_dict(hessian_dict, model_parameters)
+    hessian_variables = get_hessian_variables(model)
+    hessian_dict = hessian(loss_fn)(hessian_variables)
+    hessian_matrix = build_hessian_matrix_from_dict(hessian_dict, hessian_variables)
     return hessian_matrix
 
 
@@ -695,7 +741,9 @@ class ParameterCovariance(NamedTuple):
 
     `matrix` inverts the identifiable submatrix, and `rows` says which row of the full Fisher
     information each of its rows came from, which is also a row of the parameter dataframe since
-    the two share an order.
+    the two share an order. `num_parameters` is the length of that dataframe. Under a plug-in fit
+    `rows` runs past it, the covariance covering the plugged-in values as well, and those have no
+    row in the dataframe; see `get_two_stage_parameter_covariance`.
 
     Unidentifiable parameters are left out rather than given an infinite variance: the information
     is singular in their directions, so they have no standard error, and neither has any contrast
@@ -707,23 +755,34 @@ class ParameterCovariance(NamedTuple):
     num_parameters: int
 
 
-def is_positive_definite(matrix: torch.Tensor) -> bool:
+def get_eigenvalue_tolerance(eigenvalues: torch.Tensor) -> torch.Tensor:
     """
-    Whether a symmetric matrix is positive definite, to the tolerance the rank test uses.
+    Below which magnitude an eigenvalue counts as zero.
 
-    The tolerance is the one `torch.linalg.matrix_rank` applies, so a single notion of
-    "numerically zero" covers both checks, and an eigenvalue small enough to be rounding noise is
-    not read as negative curvature.
+    The tolerance `torch.linalg.matrix_rank` applies, so rank, negative curvature and a flat
+    direction are decided against one notion of numerically zero. It scales with the largest
+    eigenvalue, which makes it a statement about the matrix as a whole rather than about any one
+    direction in it.
+    """
+    return eigenvalues.shape[0] * torch.finfo(eigenvalues.dtype).eps * eigenvalues.abs().max()
+
+
+def is_positive_semidefinite(matrix: torch.Tensor) -> bool:
+    """
+    Whether a symmetric matrix carries no negative curvature, to the tolerance the rank test uses.
+
+    An eigenvalue small enough to be rounding noise is therefore not read as negative curvature.
+    Semidefinite rather than definite, so that a matrix with a flat direction passes: a caller
+    that also needs definiteness establishes full rank separately, the two together implying it.
+    An all-zero matrix passes as well, which matters where its rows are still being handed on.
     """
     if matrix.shape[0] == 0:
         # Rank zero leaves an empty subspace, which holds no direction that could carry negative
-        # curvature. Reporting it as positive definite keeps it on the path it already took, where
+        # curvature. Reporting it as semidefinite keeps it on the path it already took, where
         # every parameter comes out unidentifiable and nothing has a standard error.
         return True
     eigenvalues = torch.linalg.eigvalsh(matrix)
-    tolerance = (matrix.shape[0] * torch.finfo(matrix.dtype).eps
-                 * eigenvalues.abs().max())
-    return bool(eigenvalues[0] > -tolerance)
+    return bool(eigenvalues[0] >= -get_eigenvalue_tolerance(eigenvalues))
 
 
 def get_parameter_covariance(
@@ -757,9 +816,11 @@ def get_parameter_covariance(
     identifiable_indices = np.sort(qr_pivots[:rank])
     identifiable_subset = fisher_information_matrix[identifiable_indices][:, identifiable_indices]
 
-    # identifiable_subset has full rank by the way it is constructed, but full rank does not make
-    # it positive definite, and only the latter makes its inverse a covariance matrix.
-    if not is_positive_definite(identifiable_subset):
+    # identifiable_subset has full rank by the way it is constructed, and full rank together with
+    # no negative curvature is positive definiteness, which is what makes the inverse a covariance
+    # matrix. Full rank on its own does not: an indefinite matrix is full rank whenever none of
+    # its eigenvalues is near zero.
+    if not is_positive_semidefinite(identifiable_subset):
         return None
 
     return ParameterCovariance(matrix=torch.linalg.pinv(identifiable_subset).cpu(),
@@ -767,48 +828,222 @@ def get_parameter_covariance(
                                num_parameters=fisher_information_matrix.shape[0])
 
 
+# How much of the flat subspace a parameter may lie in and still be reported. Dimensionless, the
+# quantity being a projection of a coordinate direction, so one fixed number covers every matrix.
+#
+# The model's own structure puts the two quantities it has to separate far apart. The count arm
+# reaches an intron's nascent fraction through d log(mu) / d intercept_pi_logit = pi, against 1
+# for the unspliced intercept beside it, so a coverage fit that could not pin that logit down
+# leaves a flat direction orthogonal to (1, pi). That direction projects 1 / sqrt(1 + pi^2) onto
+# the logit itself, which is at least 1 / sqrt(2) whatever pi is, and pi / sqrt(1 + pi^2) onto
+# the free intercept. Its reach into any LFC stays under about 0.05, peaking at pi = 1/2 and
+# vanishing at both ends of pi's range, and shrinking as 1 / sqrt(num_introns) besides, a shared
+# LFC averaging over the introns it covers.
+#
+# Any value between those two bounds therefore drops the logit the coverage fit could not
+# determine and keeps every LFC, for every pi, every intron count and either arithmetic
+# precision. The value below sits near the middle of that range on a log scale, so it is a
+# choice between bounds rather than a tuning parameter.
+#
+# The rule is one-sided because the ends of pi's range are not mirror images. At pi -> 0 there
+# are no nascent reads, so the logit cannot move the counts and its reach into everything else
+# vanishes: irrelevant. At pi -> 1 every intron read is nascent, so the logit and the unspliced
+# intercept scale the total by the same factor: redundant rather than irrelevant, and both have
+# to go. The coverage arm is the symmetric one, its information about the logit going as
+# pi * (1 - pi).
+MIN_NULL_SPACE_COMPONENT = 0.2
+
+
+def get_rows_outside_null_space(matrix: torch.Tensor) -> np.ndarray:
+    """
+    The rows of a symmetric positive semidefinite matrix that no flat direction reaches.
+
+    Dropping *rows* rather than directions is what makes the result invertible while still being
+    addressable by parameter, which is what the parameter table and the Wald contrasts need. A
+    row that lies along a flat direction has no variance to report: the information says nothing
+    about that direction, so nothing is known about any parameter with a component in it. The
+    rows that survive are then reported conditional on the dropped ones, inverting a submatrix
+    being what that amounts to, so a standard error beside a dropped parameter can come out
+    slightly below what the same fit reported with that parameter constrained. This is the
+    convention `get_parameter_covariance` already follows, there being no finite marginal
+    variance to report instead.
+
+    `get_parameter_covariance` asks a narrower version of the same question through a
+    rank-revealing QR, which drops one row per flat direction and keeps the rest. That is the
+    right answer when the flat directions are themselves coordinate directions, which is the case
+    for a single-stage fit, where a parameter is unidentifiable when the data say nothing about
+    it. A two-stage information matrix is different: a flat direction of stage one reappears in
+    the joint information tilted into stage two's free parameters, so it can run across several
+    coordinates at once and QR would keep all but one of them, each with the standard error it
+    would have had if the flat direction were known.
+
+    The surviving submatrix is positive definite whenever the whole matrix is semidefinite. A
+    vector in its kernel, extended by zeros, has zero curvature in the full matrix and so lies in
+    its null space, while being zero on every row this dropped -- and a null space of dimension
+    `d` over `n` rows always has some row projecting at least `sqrt(d / n)` into it, so there is
+    always such a row.
+    """
+    eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
+    # Being relative to the whole matrix, this would make stage two's own parameters look flat
+    # beside a stage one determined astronomically better than them. Both arms count the same
+    # reads, which is what keeps the two scales within sight of each other.
+    tolerance = get_eigenvalue_tolerance(eigenvalues)
+    null_space = eigenvectors[:, eigenvalues.abs() <= tolerance]
+    if null_space.shape[1] == 0:
+        return np.arange(matrix.shape[0])
+    # How far each coordinate direction projects into the flat subspace. The row norm rather than
+    # the largest entry, because `eigh` returns an arbitrary orthonormal basis of a subspace of
+    # more than one dimension and only the norm is the same whichever basis it picks.
+    reach = null_space.norm(dim=1)
+    return np.flatnonzero((reach < MIN_NULL_SPACE_COMPONENT).numpy())
+
+
+def get_two_stage_parameter_covariance(
+        hessian_matrix: torch.Tensor,
+        num_free_parameters: int,
+        plug_in_information: torch.Tensor) -> Optional[ParameterCovariance]:
+    """
+    The covariance of a plug-in fit, corrected for the uncertainty in what was plugged in.
+
+    A stage-two fit that treats the plugged-in values as known understates its own uncertainty,
+    because those values are themselves estimates. Murphy and Topel (1985) give the correction;
+    with `V2` the naive stage-two covariance, `I_21` the mixed block of the stage-two loss
+    Hessian, `V1` the plugged-in values' covariance and `M = V2 I_21`,
+
+        Var(free)             = V2 + M V1 M'
+        Cov(free, plugged-in) = -M V1
+        Var(plugged-in)       = V1
+
+    The general form carries a third term in the covariance between the two stages' scores. Here
+    that term is exactly zero, and not merely asymptotically: the stage-two score is a function
+    of the read counts alone, while the stage-one score is that of the coverage shape, which
+    given those counts is multinomial and so has conditional mean zero. That is the same
+    Poisson-multinomial factorization the joint likelihood rests on, and it is what leaves the
+    correction a sum.
+
+    Those three blocks are one matrix inverse, which is the form this computes. Writing `I_1` for
+    stage one's own information, so `V1 = I_1^-1`, and `I_22` for the free block of the
+    stage-two Hessian, so `V2 = I_22^-1`, the correction above is the inverse of
+
+        J = [ I_22                      I_21 ]
+            [ I_12      I_12 V2 I_21 +  I_1  ]
+
+    as follows from `I_22 M = I_21`. Taking that route is what lets stage one hand over its
+    information rather than its inverse, and that is the difference between a usable correction
+    and none at all: an intron whose pi the coverage shape cannot pin down leaves a row of zeros
+    in `I_1`, which `J` carries without complaint, where `V1` would not exist. The flat direction
+    is then a flat direction of `J` -- exactly, since `J (-M v; v) = 0` whenever `I_1 v = 0` --
+    and `get_rows_outside_null_space` drops the parameters that lie along it, leaving the rest of
+    the gene with standard errors. Where `I_1` has no flat direction nothing is dropped and this
+    is the plain correction.
+
+    `J` therefore departs from the information of the joint model, which has `I_11 + I_1` in
+    that corner with `I_11` the count arm's own curvature in the plugged-in directions. Standing
+    `I_12 V2 I_21` there instead is the whole difference between plugging stage one's values in
+    and fitting both arms together, and it is why the count arm's curvature in those directions
+    is never read.
+
+    The arithmetic runs in double precision and the result is cast back. `J`'s plugged-in corner
+    is a sum whose two terms can be many orders apart: a pi against the edge of its range makes
+    `I_1` arbitrarily small, while `I_12 V2 I_21` beside it stays the size of the count arm. In
+    single precision that product's own rounding error exceeds `I_1` outright, and what is left
+    of stage one is noise -- full rank, generically, so the flat direction would not even show up
+    as one and the standard errors would come back off the noise.
+
+    The result spans the plugged-in values as well as the free parameters, so a contrast mixing
+    the two needs no special case and every rate ratio gets a standard error again, including the
+    one that is plugged in -- whose standard error comes back as exactly stage one's own. Its rows
+    past `num_parameters` are the plugged-in values, which have no row in the parameter table.
+
+    Positive definiteness needs no separate check here, unlike in `get_parameter_covariance`:
+    `J` is `blkdiag(I_22, I_1)` plus `[0; I_12] V2 [0; I_21]`, so it is positive semidefinite
+    whenever `I_22` and `I_1` are, and dropping the flat rows leaves it definite. An `I_1` large
+    enough to make `V1` zero reproduces the naive covariance, and reports the plugged-in values
+    as known.
+
+    None when the free block cannot be inverted, and when the mixed block carries non-finite
+    entries. A stage one that handed over no `I_1` at all does not reach here, there being
+    nothing to correct with; the caller reports no Wald results for that fit, and
+    `CoverageFitStatus` on it says why stage one had none.
+    """
+    # The free block first, on its own, both because `V2` appears in `J` and because this is
+    # where an unusable stage-two Hessian is caught. `J` is then built on whatever subspace of
+    # the free parameters it could invert.
+    covariance_free = get_parameter_covariance(
+        hessian_matrix[:num_free_parameters, :num_free_parameters])
+    if covariance_free is None:
+        return None
+
+    hessian_matrix = hessian_matrix.cpu().double()
+    information_free = hessian_matrix[covariance_free.rows][:, covariance_free.rows]
+    mixed = hessian_matrix[covariance_free.rows][:, num_free_parameters:]
+    plug_in_block = (mixed.T @ covariance_free.matrix.double() @ mixed
+                     + plug_in_information.cpu().double())
+    joint_information = torch.cat([
+        torch.cat([information_free, mixed], dim=1),
+        torch.cat([mixed.T, plug_in_block], dim=1)], dim=0)
+
+    # The mixed block is outside what the free block's own check covered, so it is checked here.
+    if not torch.isfinite(joint_information).all().item():
+        return None
+
+    rows = np.concatenate([covariance_free.rows,
+                           np.arange(num_free_parameters, hessian_matrix.shape[0])])
+    identifiable = get_rows_outside_null_space(joint_information)
+    matrix = torch.linalg.inv(joint_information[identifiable][:, identifiable])
+    return ParameterCovariance(matrix=matrix.to(covariance_free.matrix.dtype),
+                               rows=rows[identifiable],
+                               num_parameters=num_free_parameters)
+
+
 def get_plug_in_coverage_fit(model: IntronCoverageModel,
-                             parameter_covariance: Optional[ParameterCovariance],
+                             fisher_information_matrix: Optional[torch.Tensor],
                              training_diverged: bool,
                              computes_fisher_information: bool = True) -> PlugInCoverageFit:
     """
     Read one `IntronCoverageModel` fit into the plug-in record, whatever its granularity.
 
-    The covariance is the submatrix of the inverse Fisher information on this fit's parameters,
-    addressed through `get_flat_parameter_offsets` the same way the Wald contrasts are, so this
-    inherits the positional row order rather than assuming one. For a fit of all its own
-    parameters that submatrix is the whole matrix; it is written as a selection anyway, because the
-    identifiable subspace can be smaller.
+    The Fisher information is handed on as it stands rather than inverted. Inverting it here
+    would make an intron whose pi the coverage shape cannot pin down cost the whole fit its
+    correction, where a row of zeros costs only that intron;
+    `get_two_stage_parameter_covariance` is where the inverse is taken, jointly with stage two's
+    own information, and where the flat directions are dropped.
 
-    A single unidentifiable row leaves the whole covariance as None, since stage two freezes the
-    parameters as a vector and a correction built from part of that vector would be wrong rather
-    than partial.
+    The rows are this fit's parameters, addressed through `get_flat_parameter_offsets` the same
+    way the Wald contrasts are, so this inherits the positional row order rather than assuming
+    one. For a fit of all its own parameters that selection is the whole matrix; it is written
+    as a selection anyway, so that the row order the consumer relies on is stated here.
+
+    None when the Hessian has non-finite entries, and when it carries negative curvature: the
+    optimizer stops on the gradient and the loss rather than on a second-order condition, so the
+    point it stopped at need not be a maximum of the likelihood, and the Hessian there is not an
+    information matrix. A flat direction is not negative curvature and passes, a matrix that is
+    flat in every direction included: its rows are still handed on, and the correction then
+    reports whichever free parameters the count arm does not couple to the plugged-in values.
 
     `computes_fisher_information` is False for the penalized refit and the genome-wide variant,
-    neither of which builds a Fisher information at all, so an absent covariance there is not a
-    failed fit.
+    neither of which builds a Fisher information at all, so an absent one there is not a failed
+    fit.
     """
     with torch.no_grad():
         lfc_elong_over_splice = model.lfc_elong_over_splice.detach()[:, 0].cpu()
         intercept_pi_logit = model.intercept_pi_logit.detach().cpu()
 
-    covariance: Optional[torch.Tensor] = None
-    if parameter_covariance is not None:
+    fisher_information: Optional[torch.Tensor] = None
+    if fisher_information_matrix is not None:
         offsets = get_flat_parameter_offsets(dict(model.named_parameters()))
         parameter_rows = (
                 [offsets[LFCParameter.ELONG_OVER_SPLICE] + feature_index
                  for feature_index in range(len(model.feature_names))]
                 + [offsets['intercept_pi_logit'] + intron_index
                    for intron_index in range(len(model.intron_names))])
-        position_of_row = {row: position
-                           for position, row in enumerate(parameter_covariance.rows)}
-        if all(row in position_of_row for row in parameter_rows):
-            positions = [position_of_row[row] for row in parameter_rows]
-            covariance = parameter_covariance.matrix[positions][:, positions]
+        selected = fisher_information_matrix[parameter_rows][:, parameter_rows].cpu()
+        if torch.isfinite(selected).all().item() and is_positive_semidefinite(selected):
+            fisher_information = selected
 
     if training_diverged:
         status = CoverageFitStatus.TRAINING_DIVERGED
-    elif covariance is None and computes_fisher_information:
+    elif fisher_information is None and computes_fisher_information:
         status = CoverageFitStatus.NOT_ESTIMABLE
     else:
         status = CoverageFitStatus.OK
@@ -816,7 +1051,7 @@ def get_plug_in_coverage_fit(model: IntronCoverageModel,
     return PlugInCoverageFit(intron_names=list(model.intron_names),
                              lfc_elong_over_splice=lfc_elong_over_splice,
                              intercept_pi_logit=intercept_pi_logit,
-                             covariance=covariance,
+                             fisher_information=fisher_information,
                              status=status)
 
 
@@ -827,17 +1062,18 @@ def concat_plug_in_coverage_fits(fits: list[PlugInCoverageFit],
     Collect one chunk's fits into the artifact it writes.
 
     `feature_names` is passed in, so that a chunk holding no fits still writes a well-formed
-    artifact, and so that a covariance of the wrong width is caught here rather than much later as
-    a correction built from the wrong parameters.
+    artifact, and so that a Fisher information of the wrong width is caught here rather than much
+    later as a correction built from the wrong parameters.
     """
     for fit in fits:
         expected_side = len(feature_names) + len(fit.intron_names)
         expected_shape = (expected_side, expected_side)
-        if fit.covariance is not None and tuple(fit.covariance.shape) != expected_shape:
+        if (fit.fisher_information is not None
+                and tuple(fit.fisher_information.shape) != expected_shape):
             raise ValueError(
-                f'Coverage fit of {fit.intron_names} has a {tuple(fit.covariance.shape)} '
-                f'covariance, expected {expected_shape} for '
-                f'{len(feature_names)} features.')
+                f'Coverage fit of {fit.intron_names} has a '
+                f'{tuple(fit.fisher_information.shape)} Fisher information, expected '
+                f'{expected_shape} for {len(feature_names)} features.')
     return PlugInCoverageFits(fits=list(fits), feature_names=list(feature_names),
                               is_regularized=is_regularized)
 
@@ -865,11 +1101,16 @@ def add_wald_test_results(df_param: pd.DataFrame,
     if not df_param.index.equals(pd.RangeIndex(parameter_covariance.num_parameters)):
         raise ValueError(f'Unexpected value of df_param.index: {df_param=}')
 
-    identifiable_indices = parameter_covariance.rows
+    # A plug-in fit's covariance also covers the values taken from the coverage fit, which are
+    # not parameters of this model and have no row here. They are reported by the fit that
+    # estimated them.
+    has_parameter_row = parameter_covariance.rows < parameter_covariance.num_parameters
+    identifiable_indices = parameter_covariance.rows[has_parameter_row]
     # No clamp on the variance: get_parameter_covariance only returns a positive definite matrix,
     # so a negative here would be a bug, and a NaN standard error is how it should show up. Clamping
     # it to zero would instead report an infinite z score and a p value of exactly zero.
-    standard_errors = torch.sqrt(torch.diag(parameter_covariance.matrix)).numpy()
+    standard_errors = torch.sqrt(
+        torch.diag(parameter_covariance.matrix)).numpy()[has_parameter_row]
 
     df_param['identifiable'] = df_param.index.isin(identifiable_indices)
     df_param.loc[identifiable_indices, 'SE'] = standard_errors
@@ -898,19 +1139,17 @@ def get_contrast_of_ratio(model: nn.Module,
     `model` has to be the full model. A reduced one holds the tested ratio in `reduced_lfc`, which
     has neither a row in the parameter dataframe nor a standard error to report.
 
-    A plugged-in LFC has no row either, being a buffer rather than a parameter, so it drops out
-    of the contrast the same way an absent design column does. The standard error that comes back
-    is then the one conditional on the plugged-in value, which understates the uncertainty until
-    the stage-one variance is added back. A contrast left with no rows at all -- the plugged-in
-    ratio itself -- is reported as not identifiable rather than as a standard error of zero.
+    A plugged-in LFC does have a row, `get_hessian_variables` placing it after the free
+    parameters, so a ratio that mixes plugged-in and fitted values is addressed here like any
+    other and the two-stage covariance has the entries to evaluate it.
     """
-    model_parameters = dict(model.named_parameters())
-    parameter_offsets = get_flat_parameter_offsets(model_parameters)
+    hessian_variables = get_hessian_variables(model)
+    parameter_offsets = get_flat_parameter_offsets(hessian_variables)
 
     def get_row(lfc_attribute: str, column_name) -> Optional[int]:
-        if pd.isna(column_name) or lfc_attribute not in model_parameters:
+        if pd.isna(column_name):
             return None
-        lfc = model_parameters[lfc_attribute]
+        lfc = hessian_variables[lfc_attribute]
         feature_index = model.feature_names.index(column_name)
         # Mirrors `_get_lfc_without_intron_axis`: the elongation and splicing LFCs carry a second
         # axis, over the introns or a singleton, while initiation never does.
@@ -939,9 +1178,9 @@ def get_contrast_wald_results(parameter_covariance: Optional[ParameterCovariance
     standard error at all and is reported as not identifiable, which is the conservative reading
     when the ratio combines two parameters and only one of them is identifiable.
 
-    An empty contrast is reported the same way. It is what a ratio built entirely from plugged-in
-    values comes to, and this Fisher information genuinely has nothing to say about it; a
-    standard error of zero would instead say it was known exactly.
+    An empty contrast is reported the same way: there is nothing for the covariance to be
+    evaluated on, and a standard error of zero would instead say the effect size was known
+    exactly.
     """
     not_identifiable = {'lfc_se': np.nan,
                         'z_score': np.nan,
@@ -1165,8 +1404,10 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
     gene otherwise; `PlugInCoverage.from_fits` is where that is checked. Five of the six ratios
     are then tested as usual and elong/splice is not, its test being the coverage fit's own.
 
-    The standard errors reported under the plug-in are conditional on the plugged-in values, so
-    they understate the uncertainty until the variance correction is applied downstream.
+    The standard errors account for the uncertainty in what was plugged in, through
+    `get_two_stage_parameter_covariance`, so they are comparable with those of a joint fit. The
+    chi-squared statistics do not: each reduced fit treats the plugged-in values as known, so the
+    likelihood ratio tests are anti-conservative where the Wald columns beside them are not.
     """
     gene_data = gene_data.to(device)
     dataset_metadata = dataset_metadata.to(device)
@@ -1175,9 +1416,7 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
     if plug_in_coverage_fits is not None:
         plug_in_coverage = PlugInCoverage.from_fits(plug_in_coverage_fits,
                                                     gene_data.intron_names,
-                                                    intron_specific_lfc)
-        plug_in_coverage = PlugInCoverage(
-            *(value.to(device) for value in plug_in_coverage))
+                                                    intron_specific_lfc).to(device)
     tested_ratios = (PLUG_IN_TESTABLE_RATIOS if plug_in_coverage is not None
                      else tuple(TestedRatio))
 
@@ -1273,9 +1512,25 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
                                 predicted_pi=predicted_pi)
 
     fisher_information_matrix = get_fisher_information_matrix(model_full, rna_kinetics_loss_by_params)
-    parameter_covariance = get_parameter_covariance(fisher_information_matrix)
+    if plug_in_coverage is None:
+        parameter_covariance = get_parameter_covariance(fisher_information_matrix)
+        free_information_matrix = fisher_information_matrix
+    else:
+        # The Hessian spans the plugged-in values too, and only its free block is an information
+        # matrix, so that is the block the reported diagnostics describe. A stage one that handed
+        # over no information leaves nothing to correct with, so there are no Wald results at all,
+        # and then `loss_hessian_is_positive_definite` is False although the block itself was
+        # fine; the coverage fit's own `CoverageFitStatus` is what says which of the two happened.
+        num_free_parameters = sum(parameter.numel() for parameter in model_full.parameters())
+        free_information_matrix = fisher_information_matrix[
+            :num_free_parameters, :num_free_parameters]
+        parameter_covariance = None
+        if plug_in_coverage.fisher_information is not None:
+            parameter_covariance = get_two_stage_parameter_covariance(
+                fisher_information_matrix, num_free_parameters,
+                plug_in_coverage.fisher_information)
     model_param_df = add_wald_test_results(model_param_df, parameter_covariance,
-                                           fisher_information_matrix)
+                                           free_information_matrix)
 
     ratio_lfc_df = get_ratio_lfc_df(
         model_full, parameter_covariance,
@@ -1471,6 +1726,7 @@ def get_intron_coverage_model_results(
     model_param_df['num_epochs_full_model'] = results_full.num_epochs
 
     parameter_covariance: Optional[ParameterCovariance] = None
+    fisher_information_matrix: Optional[torch.Tensor] = None
     if not is_global_model:
         coverage_loss_fn = CoverageLoss(num_position_coverage=coverage.shape[2]).to(device)
 
@@ -1535,7 +1791,7 @@ def get_intron_coverage_model_results(
         test_results=pd.DataFrame(test_results_list),
         state_dict_full_model=model_full.state_dict(),
         plug_in_coverage_fit=get_plug_in_coverage_fit(
-            model_full, parameter_covariance,
+            model_full, fisher_information_matrix,
             training_diverged=results_full.training_diverged,
             computes_fisher_information=not is_global_model))
 
@@ -1636,9 +1892,7 @@ def get_global_rna_kinetics_model_results(
     if plug_in_coverage_fits is not None:
         plug_in_coverage = PlugInCoverage.from_fits(plug_in_coverage_fits,
                                                     global_gene_data.intron_names,
-                                                    intron_specific_lfc=False)
-        plug_in_coverage = PlugInCoverage(
-            *(value.to(device) for value in plug_in_coverage))
+                                                    intron_specific_lfc=False).to(device)
     tested_ratios = (GLOBAL_PLUG_IN_TESTABLE_RATIOS if plug_in_coverage is not None
                      else GLOBAL_MODEL_TESTED_RATIOS)
 
@@ -1800,6 +2054,6 @@ def get_regularized_intron_coverage_model_results(
         model_parameters=model_param_df,
         ratio_lfcs=ratio_lfc_df,
         plug_in_coverage_fit=get_plug_in_coverage_fit(
-            model_regularized, parameter_covariance=None,
+            model_regularized, fisher_information_matrix=None,
             training_diverged=training_results_regularized.training_diverged,
             computes_fisher_information=False))

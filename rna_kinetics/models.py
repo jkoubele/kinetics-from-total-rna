@@ -108,6 +108,10 @@ class CoverageFitStatus(StrEnum):
     Single-valued, with `training_diverged` taking precedence over `not_estimable`, because the
     only question a consumer asks is whether the fit is usable. The individual diagnostics stay in
     `model_parameters.tsv`, which reports the divergence flag and the Wald columns separately.
+
+    `not_estimable` is about the Fisher information as a whole, not about any one intron: an
+    intron whose pi the coverage shape cannot pin down leaves a row of zeros, which is a usable
+    statement and is handed on as one.
     """
     OK = 'ok'
     TRAINING_DIVERGED = 'training_diverged'
@@ -119,9 +123,9 @@ class PlugInCoverageFit:
     """
     One `IntronCoverageModel` fit, in the form a plug-in estimator consumes.
 
-    A plug-in stage two freezes a whole coverage fit at once, so the variance correction needs the
-    joint covariance of everything that fit estimated: one `lfc_elong_over_splice` together with
-    the intercepts of every intron it was fitted over. The three granularities of the coverage
+    A plug-in stage two freezes a whole coverage fit at once, so the variance correction needs
+    the joint uncertainty of everything that fit estimated: one `lfc_elong_over_splice` together
+    with the intercepts of every intron it was fitted over. The three granularities of the coverage
     model differ only in the length of `intron_names`, which is one intron, a gene's introns, or
     the whole dataset's.
 
@@ -130,15 +134,19 @@ class PlugInCoverageFit:
     carried here so that the artifact stands on its own and a consumer needs no join against a
     published table.
 
-    `covariance` is the inverse Fisher information over those same values, in that order, so it is
-    square of side `num_features + num_introns`. It is the one quantity the TSVs have no column
-    for, which is the reason this artifact exists: `model_parameters.tsv` reports only its
-    diagonal, as `SE`. None when there is no covariance to report, which `status` then explains.
+    `fisher_information` is the Fisher information over those same values, in that order, so it
+    is square of side `num_features + num_introns`. It is the one quantity the TSVs have no
+    column for, which is the reason this artifact exists: `model_parameters.tsv` reports the
+    diagonal of its inverse, as `SE`. Handing over the information rather than the inverse is
+    what lets a fit with a flat direction still be used: an intron whose pi sits at the edge of
+    its range contributes a row of zeros, where the inverse would not exist at all. Stage two
+    inverts it jointly with its own information, in `get_two_stage_parameter_covariance`. None
+    when there is none to report, which `status` then explains.
     """
     intron_names: list[str]
     lfc_elong_over_splice: torch.Tensor  # (num_features,)
     intercept_pi_logit: torch.Tensor  # (num_introns,)
-    covariance: Optional[torch.Tensor]  # (num_features + num_introns) square, or None
+    fisher_information: Optional[torch.Tensor]  # (num_features + num_introns) square, or None
     status: CoverageFitStatus
 
 
@@ -149,15 +157,45 @@ class PlugInCoverageFits:
 
     A wire format, so the field names cross a process boundary. Chunks merge by concatenating
     `fits`. `feature_names` describes the design, which every fit in the chunk shares and which is
-    what makes the covariance axes readable on the far side; `intron_names` describes a single fit
-    and so sits on it.
+    what makes the information matrix's axes readable on the far side; `intron_names` describes a
+    single fit and so sits on it.
 
-    `is_regularized` says these came from the penalized refit, whose fits carry no covariance: the
-    Hessian of a penalized objective is not an information matrix.
+    `is_regularized` says these came from the penalized refit, whose fits carry no Fisher
+    information: the Hessian of a penalized objective is not one.
     """
     fits: list[PlugInCoverageFit]
     feature_names: list[str]
     is_regularized: bool = False
+
+
+def _assemble_fisher_information_from_sources(
+        sources: list[tuple[PlugInCoverageFit, int]]) -> Optional[torch.Tensor]:
+    """
+    One Fisher information over rows drawn from several coverage fits.
+
+    Rows from different fits are independent, those fits having been run on disjoint introns'
+    coverage, so the result is block diagonal by fit and is assembled one block at a time. None
+    as soon as any contributing fit has none, since a fit without one is a fit whose Hessian was
+    unusable, and reading that as a block of zeros would state that its values are unconstrained
+    rather than that nothing is known about how well they are constrained.
+    """
+    if any(fit.fisher_information is None for fit, _ in sources):
+        return None
+
+    rows_by_fit: dict[int, tuple[PlugInCoverageFit, list[int], list[int]]] = {}
+    for position, (fit, row) in enumerate(sources):
+        _, positions, rows = rows_by_fit.setdefault(id(fit), (fit, [], []))
+        positions.append(position)
+        rows.append(row)
+
+    fisher_information = torch.zeros(len(sources), len(sources),
+                                     dtype=sources[0][0].fisher_information.dtype)
+    for fit, positions, rows in rows_by_fit.values():
+        position_index = torch.tensor(positions)
+        row_index = torch.tensor(rows)
+        fisher_information[position_index[:, None], position_index[None, :]] = (
+            fit.fisher_information[row_index[:, None], row_index[None, :]])
+    return fisher_information
 
 
 class PlugInCoverage(NamedTuple):
@@ -168,9 +206,24 @@ class PlugInCoverage(NamedTuple):
     intron-specific and (num_features, 1) where it would be shared, and `intercept_pi_logit` is
     (num_introns,) in the model's intron order. Built by `from_fits`, which is where the fits'
     intron names are matched against the model's.
+
+    `fisher_information` is those same values' joint Fisher information from stage one, in the
+    order the model flattens them: the LFC in C order over (feature, intron), then one intercept
+    per intron. It is what a two-stage variance correction consumes, and None when any
+    contributing fit reports none. The model itself ignores it, holding only the point values,
+    but it is laid out here so that the matching of fits to introns is written once.
     """
     lfc_elong_over_splice: torch.Tensor
     intercept_pi_logit: torch.Tensor
+    fisher_information: Optional[torch.Tensor] = None
+
+    def to(self, device) -> 'PlugInCoverage':
+        """The same layout on `device`, leaving an absent Fisher information absent."""
+        return PlugInCoverage(
+            lfc_elong_over_splice=self.lfc_elong_over_splice.to(device),
+            intercept_pi_logit=self.intercept_pi_logit.to(device),
+            fisher_information=(None if self.fisher_information is None
+                                else self.fisher_information.to(device)))
 
     def check_shapes(self, lfc_shape: tuple[int, ...], num_introns: int) -> None:
         """Refuse a layout built for a different model than the one plugging it in."""
@@ -182,6 +235,13 @@ class PlugInCoverage(NamedTuple):
             raise ValueError(
                 f'Plugged-in intercept_pi_logit has shape '
                 f'{tuple(self.intercept_pi_logit.shape)}, expected {(num_introns,)}.')
+        expected_side = self.lfc_elong_over_splice.numel() + num_introns
+        if (self.fisher_information is not None
+                and tuple(self.fisher_information.shape) != (expected_side, expected_side)):
+            raise ValueError(
+                f'Plugged-in Fisher information has shape '
+                f'{tuple(self.fisher_information.shape)}, expected '
+                f'{(expected_side, expected_side)}.')
 
     @staticmethod
     def from_fits(fits: list[PlugInCoverageFit],
@@ -207,15 +267,8 @@ class PlugInCoverage(NamedTuple):
         if missing:
             raise ValueError(f'No coverage fit covers introns {missing}.')
 
-        intercept_pi_logit = torch.stack([
-            fit_of_intron[intron_name].intercept_pi_logit[
-                fit_of_intron[intron_name].intron_names.index(intron_name)]
-            for intron_name in intron_names])
-
         if intron_specific_lfc:
-            lfc_columns = [fit_of_intron[intron_name].lfc_elong_over_splice
-                           for intron_name in intron_names]
-            lfc_elong_over_splice = torch.stack(lfc_columns, dim=1)
+            lfc_fits = [fit_of_intron[intron_name] for intron_name in intron_names]
         else:
             # Shared across the model's introns, so every one of them has to come from the same
             # fit; otherwise the values being plugged in are not a single shared LFC at all.
@@ -224,11 +277,31 @@ class PlugInCoverage(NamedTuple):
                 raise ValueError(
                     f'lfc_elong_over_splice is shared across {len(intron_names)} introns, so they '
                     f'must come from one coverage fit, but they come from {len(distinct_fits)}.')
-            lfc_elong_over_splice = fit_of_intron[
-                intron_names[0]].lfc_elong_over_splice.unsqueeze(1)
+            lfc_fits = [fit_of_intron[intron_names[0]]]
 
-        return PlugInCoverage(lfc_elong_over_splice=lfc_elong_over_splice,
-                              intercept_pi_logit=intercept_pi_logit)
+        lfc_elong_over_splice = torch.stack(
+            [fit.lfc_elong_over_splice for fit in lfc_fits], dim=1)
+        intercept_pi_logit = torch.stack([
+            fit_of_intron[intron_name].intercept_pi_logit[
+                fit_of_intron[intron_name].intron_names.index(intron_name)]
+            for intron_name in intron_names])
+
+        # Where each row of the layout came from, as (fit, that fit's own row), in the order the
+        # model flattens these two values. Both the LFC in C order over (feature, intron) and the
+        # intercepts after it, matching how `get_plug_in_coverage_fit` ordered each fit's own
+        # Fisher information: that fit's features first, then its introns.
+        num_features = lfc_elong_over_splice.shape[0]
+        sources = [(lfc_fits[column], feature_index)
+                   for feature_index in range(num_features)
+                   for column in range(len(lfc_fits))]
+        sources += [(fit_of_intron[intron_name],
+                     num_features + fit_of_intron[intron_name].intron_names.index(intron_name))
+                    for intron_name in intron_names]
+
+        return PlugInCoverage(
+            lfc_elong_over_splice=lfc_elong_over_splice,
+            intercept_pi_logit=intercept_pi_logit,
+            fisher_information=_assemble_fisher_information_from_sources(sources))
 
 
 class LRTSpecification(NamedTuple):
