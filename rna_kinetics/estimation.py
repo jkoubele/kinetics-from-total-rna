@@ -485,11 +485,18 @@ def _make_closures(
 # three jointly penalises all six; doing it with one covariance rather than six separate weights is
 # what keeps the implied prior a distribution at all.
 #
-# These are ratios rather than parameters, and need not be the three the models parametrize: the
-# basis is the wire format shared with `estimate_prior_variance.R`, so it is fixed by the column
-# names of `regularization_coefficients.tsv`. `get_prior_penalty` writes each basis ratio in terms
-# of the parameters through `RATIO_AS_LFC_COMBINATION`, which is also why the penalty itself is
-# unchanged by a change of basis: the quadratic form is the same one either way.
+# These are ratios rather than parameters, and they cannot be the three the models parametrize.
+# `estimate_prior_variance.R` is handed the six ratios' variances and no covariances, so it
+# recovers each pair's from `cov(a, b) = (var(a) + var(b) - var(a - b)) / 2`, which needs `a - b`
+# to be one of the six as well. Each ratio is a difference of two log rates, and two of them
+# combine into a third only when they share a rate, so the reconstruction works exactly for the
+# bases whose three ratios are all over one common rate. Four of the sixteen bases are like that,
+# and the parametrization is not one of them.
+#
+# `get_prior_penalty` writes each basis ratio in terms of the parameters through
+# `RATIO_AS_LFC_COMBINATION`, so the penalty is the same quadratic form in the same three linear
+# functionals under either one, and the basis stays a wire format fixed by the column names of
+# `regularization_coefficients.tsv`.
 LFC_PRIOR_BASIS = (TestedRatio.INIT_OVER_DEG,
                    TestedRatio.ELONG_OVER_DEG,
                    TestedRatio.SPLICE_OVER_DEG)

@@ -63,6 +63,10 @@ if (!dir.exists(output_folder)) {
 
 # The basis the penalty acts on when the input holds the per-gene model's ratios: the other three
 # are differences of these, so their priors follow from the same matrix instead of being fitted.
+# All three are over the same rate, which is what makes every pairwise difference another of the
+# six and so lets DIFFERENCE_OF below rebuild the sampling covariances from variances alone. A
+# basis not sharing one rate leaves some pair's covariance with nothing to read it off, which is
+# why this is not the basis the models are parametrized in.
 #
 # An input that does not hold all three, such as the intron coverage model's single
 # lfc_elong_over_splice, has no such structure to exploit and is fitted one ratio at a time. That
