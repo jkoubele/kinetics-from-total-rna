@@ -762,7 +762,8 @@ class ParameterCovariance(NamedTuple):
     num_parameters: int
 
 
-def get_eigenvalue_tolerance(eigenvalues: torch.Tensor) -> torch.Tensor:
+def get_eigenvalue_tolerance(eigenvalues: torch.Tensor,
+                             data_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
     """
     Below which magnitude an eigenvalue counts as zero.
 
@@ -770,8 +771,14 @@ def get_eigenvalue_tolerance(eigenvalues: torch.Tensor) -> torch.Tensor:
     direction are decided against one notion of numerically zero. It scales with the largest
     eigenvalue, which makes it a statement about the matrix as a whole rather than about any one
     direction in it.
+
+    `data_dtype` is the precision the entries were computed in, for a matrix now held in a wider
+    one. Promoting a matrix to double for the arithmetic leaves its entries no more accurate than
+    they were, so a tolerance read off the container would be orders too tight and an exact zero
+    would come back looking like a small nonzero eigenvalue.
     """
-    return eigenvalues.shape[0] * torch.finfo(eigenvalues.dtype).eps * eigenvalues.abs().max()
+    eps = torch.finfo(data_dtype if data_dtype is not None else eigenvalues.dtype).eps
+    return eigenvalues.shape[0] * eps * eigenvalues.abs().max()
 
 
 def is_positive_semidefinite(matrix: torch.Tensor) -> bool:
@@ -792,14 +799,36 @@ def is_positive_semidefinite(matrix: torch.Tensor) -> bool:
     return bool(eigenvalues[0] >= -get_eigenvalue_tolerance(eigenvalues))
 
 
+def invert_information(information: torch.Tensor) -> Optional[torch.Tensor]:
+    """
+    The covariance an information matrix implies, or None where it cannot be inverted.
+
+    A true inverse rather than a pseudoinverse, although both callers pass a submatrix they have
+    already established is positive definite. A pseudoinverse zeroes whatever singular value falls
+    below its tolerance, which reports a *smaller* variance for a direction the data barely
+    determine, as though that direction were pinned rather than unknown. A true inverse reports a
+    large one instead, and refuses outright once the matrix is singular, so the failure is visible
+    in the output rather than hidden in it.
+
+    None rather than the exception, so one gene whose submatrix is numerically singular costs its
+    own Wald results and not its whole chunk's.
+    """
+    try:
+        return torch.linalg.inv(information)
+    except torch.linalg.LinAlgError:
+        return None
+
+
 def get_parameter_covariance(
         fisher_information_matrix: torch.Tensor) -> Optional[ParameterCovariance]:
     """
     Invert the Fisher information on the subspace where it has full rank.
 
-    None when the information has non-finite entries, and also when the subspace it is inverted on
-    is not positive definite. Either way there is no Wald test at all, neither for the individual
-    parameters nor for a contrast of them.
+    None when the information has non-finite entries, when the subspace it is inverted on is not
+    positive definite, and when that subspace turns out singular anyway: the rank-revealing QR
+    gives it the right rank, not a smallest singular value clear of the inverse's own tolerance.
+    Any of the three leaves no Wald test at all, neither for the individual parameters nor for a
+    contrast of them.
 
     Positive definiteness is a separate question from rank, and has to be asked separately: rank is
     decided on the magnitude of the eigenvalues, so an indefinite matrix is full rank whenever none
@@ -830,7 +859,11 @@ def get_parameter_covariance(
     if not is_positive_semidefinite(identifiable_subset):
         return None
 
-    return ParameterCovariance(matrix=torch.linalg.pinv(identifiable_subset).cpu(),
+    matrix = invert_information(identifiable_subset)
+    if matrix is None:
+        return None
+
+    return ParameterCovariance(matrix=matrix.cpu(),
                                rows=identifiable_indices,
                                num_parameters=fisher_information_matrix.shape[0])
 
@@ -838,19 +871,31 @@ def get_parameter_covariance(
 # How much of the flat subspace a parameter may lie in and still be reported. Dimensionless, the
 # quantity being a projection of a coordinate direction, so one fixed number covers every matrix.
 #
-# The model's own structure puts the two quantities it has to separate far apart. The count arm
-# reaches an intron's nascent fraction through d log(mu) / d intercept_pi_logit = pi, against 1
-# for the unspliced intercept beside it, so a coverage fit that could not pin that logit down
-# leaves a flat direction orthogonal to (1, pi). That direction projects 1 / sqrt(1 + pi^2) onto
-# the logit itself, which is at least 1 / sqrt(2) whatever pi is, and pi / sqrt(1 + pi^2) onto
-# the free intercept. Its reach into any LFC stays under about 0.05, peaking at pi = 1/2 and
-# vanishing at both ends of pi's range, and shrinking as 1 / sqrt(num_introns) besides, a shared
-# LFC averaging over the introns it covers.
+# The model's own structure puts the two quantities it has to separate far apart, and does it
+# without reference to the data. An intron's predicted reads are
 #
-# Any value between those two bounds therefore drops the logit the coverage fit could not
-# determine and keeps every LFC, for every pi, every intron count and either arithmetic
-# precision. The value below sits near the middle of that range on a log scale, so it is a
-# choice between bounds rather than a tuning parameter.
+#     mu = exp(intercept_unspliced + offset) * (exp(intercept_pi_logit + nascent_lfc)
+#                                               + exp(unspliced_lfc)),
+#
+# so d log(mu) / d intercept_unspliced = 1 while d log(mu) / d intercept_pi_logit = pi, in every
+# sample. In the plane those two parameters span the count arm's score is therefore always along
+# (1, pi), making its information there rank one however many samples there are: the number of
+# observations and the design matrix scale that one direction and leave its orthogonal complement
+# flat. So a coverage fit that could not pin the logit down leaves a flat direction along
+# (-pi, 1) / sqrt(1 + pi^2), which projects at least 1 / sqrt(2) onto the logit itself and
+# pi / sqrt(1 + pi^2) onto the free intercept beside it. Its reach into any LFC is orders smaller
+# again, the LFCs being what the design separates while this plane holds no design at all.
+#
+# Any value between those two reaches therefore drops the logit the coverage fit could not
+# determine and keeps every LFC, for every pi, every intron count, every design and either
+# arithmetic precision. Inside that range what it decides is the free intercept beside the logit,
+# at the pi solving pi / sqrt(1 + pi^2) = the threshold, so the value below is to within half a
+# percent the nascent fraction under which that intercept is still reported.
+#
+# What the bound does rest on is that no design column is constant across samples, since such a
+# column is confounded with the model's own intercepts and the flat direction is then no longer
+# confined to the plane above. `create_design_matrices.R` drops `(Intercept)` from every design
+# matrix it writes, which is what rules that out.
 #
 # The rule is one-sided because the ends of pi's range are not mirror images. At pi -> 0 there
 # are no nascent reads, so the logit cannot move the counts and its reach into everything else
@@ -858,10 +903,11 @@ def get_parameter_covariance(
 # intercept scale the total by the same factor: redundant rather than irrelevant, and both have
 # to go. The coverage arm is the symmetric one, its information about the logit going as
 # pi * (1 - pi).
-MIN_NULL_SPACE_COMPONENT = 0.2
+MIN_NULL_SPACE_COMPONENT = 0.1
 
 
-def get_rows_outside_null_space(matrix: torch.Tensor) -> np.ndarray:
+def get_rows_outside_null_space(matrix: torch.Tensor,
+                                data_dtype: Optional[torch.dtype] = None) -> np.ndarray:
     """
     The rows of a symmetric positive semidefinite matrix that no flat direction reaches.
 
@@ -890,14 +936,29 @@ def get_rows_outside_null_space(matrix: torch.Tensor) -> np.ndarray:
     `d` over `n` rows always has some row projecting at least `sqrt(d / n)` into it, so there is
     always such a row.
     """
-    eigenvalues, eigenvectors = torch.linalg.eigh(matrix)
-    # Being relative to the whole matrix, this would make stage two's own parameters look flat
-    # beside a stage one determined astronomically better than them. Both arms count the same
-    # reads, which is what keeps the two scales within sight of each other.
-    tolerance = get_eigenvalue_tolerance(eigenvalues)
+    # Scaled to a unit diagonal before the flat directions are looked for, because the tolerance
+    # is relative to the largest eigenvalue and so compares every direction against the stiffest
+    # one. Here that is the count arm's, set by read depth, against a coverage arm carrying one
+    # intron's bins, so on the matrix itself a parameter would be called flat for being less
+    # curved than something it has nothing to do with, and more of them the deeper the sequencing.
+    # The scaling leaves the off-diagonal entries bounded by one as well, the matrix being
+    # positive semidefinite, so a small eigenvalue means a linear dependence between coordinates
+    # and nothing else.
+    #
+    # A coordinate carrying no curvature at all is left unscaled instead, so its zero row stays
+    # one and reads as the flat direction it is. Semidefiniteness leaves nothing else on that
+    # branch: a negative diagonal entry can only be rounding against a zero.
+    diagonal = torch.diag(matrix)
+    scale = torch.where(diagonal > 0, diagonal.rsqrt(), torch.ones_like(diagonal))
+    eigenvalues, eigenvectors = torch.linalg.eigh(matrix * scale[:, None] * scale[None, :])
+    tolerance = get_eigenvalue_tolerance(eigenvalues, data_dtype)
     null_space = eigenvectors[:, eigenvalues.abs() <= tolerance]
     if null_space.shape[1] == 0:
         return np.arange(matrix.shape[0])
+    # Back into the matrix's own coordinates, which is where the threshold above is derived: `x`
+    # is a null vector of the matrix exactly when `x / scale` is one of the scaled matrix. The
+    # reach is a projection, so the mapped basis is orthonormalized again before it is measured.
+    null_space, _ = torch.linalg.qr(null_space * scale[:, None])
     # How far each coordinate direction projects into the flat subspace. The row norm rather than
     # the largest entry, because `eigh` returns an arbitrary orthonormal basis of a subspace of
     # more than one dimension and only the norm is the same whichever basis it picks.
@@ -968,10 +1029,11 @@ def get_two_stage_parameter_covariance(
     enough to make `V1` zero reproduces the naive covariance, and reports the plugged-in values
     as known.
 
-    None when the free block cannot be inverted, and when the mixed block carries non-finite
-    entries. A stage one that handed over no `I_1` at all does not reach here, there being
-    nothing to correct with; the caller reports no Wald results for that fit, and
-    `CoverageFitStatus` on it says why stage one had none.
+    None when the free block cannot be inverted, when the mixed block carries non-finite entries,
+    and when `J` restricted to the reported rows is singular anyway, which dropping only the rows
+    a flat direction reaches does not rule out. A stage one that handed over no `I_1` at all does
+    not reach here, there being nothing to correct with; the caller reports no Wald results for
+    that fit, and `CoverageFitStatus` on it says why stage one had none.
     """
     # The free block first, on its own, both because `V2` appears in `J` and because this is
     # where an unusable stage-two Hessian is caught. `J` is then built on whatever subspace of
@@ -981,6 +1043,12 @@ def get_two_stage_parameter_covariance(
     if covariance_free is None:
         return None
 
+    # How accurately `J`'s entries will be known: the precision its two inputs were computed in,
+    # not the double it is assembled in. `J` is exactly singular wherever `I_1` is, so reading the
+    # tolerance off the container instead would leave that zero looking merely small and an
+    # effectively singular matrix would be inverted.
+    data_dtype = max((hessian_matrix.dtype, plug_in_information.dtype),
+                     key=lambda dtype: torch.finfo(dtype).eps)
     hessian_matrix = hessian_matrix.cpu().double()
     information_free = hessian_matrix[covariance_free.rows][:, covariance_free.rows]
     mixed = hessian_matrix[covariance_free.rows][:, num_free_parameters:]
@@ -996,8 +1064,11 @@ def get_two_stage_parameter_covariance(
 
     rows = np.concatenate([covariance_free.rows,
                            np.arange(num_free_parameters, hessian_matrix.shape[0])])
-    identifiable = get_rows_outside_null_space(joint_information)
-    matrix = torch.linalg.inv(joint_information[identifiable][:, identifiable])
+    identifiable = get_rows_outside_null_space(joint_information, data_dtype)
+    matrix = invert_information(joint_information[identifiable][:, identifiable])
+    if matrix is None:
+        return None
+
     return ParameterCovariance(matrix=matrix.to(covariance_free.matrix.dtype),
                                rows=rows[identifiable],
                                num_parameters=num_free_parameters)
@@ -1113,9 +1184,12 @@ def add_wald_test_results(df_param: pd.DataFrame,
     # estimated them.
     has_parameter_row = parameter_covariance.rows < parameter_covariance.num_parameters
     identifiable_indices = parameter_covariance.rows[has_parameter_row]
-    # No clamp on the variance: get_parameter_covariance only returns a positive definite matrix,
-    # so a negative here would be a bug, and a NaN standard error is how it should show up. Clamping
-    # it to zero would instead report an infinite z score and a p value of exactly zero.
+    # No clamp on the variance. A negative one is below the rounding error of the inverse it was
+    # read from, so the variance it stands for is somewhere between zero and that bound rather
+    # than at either end, and NaN is the only one of the two a reader cannot mistake for a
+    # measurement. A standard error of exactly zero would say the parameter is known exactly, and
+    # `estimate_prior_variance.R` would take it as a sampling variance of zero, which makes the
+    # covariance matrix it builds per gene singular.
     standard_errors = torch.sqrt(
         torch.diag(parameter_covariance.matrix)).numpy()[has_parameter_row]
 
