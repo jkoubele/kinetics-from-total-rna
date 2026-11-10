@@ -485,21 +485,28 @@ def _make_closures(
 # three jointly penalises all six; doing it with one covariance rather than six separate weights is
 # what keeps the implied prior a distribution at all.
 #
-# These are ratios rather than parameters, and they cannot be the three the models parametrize.
-# `estimate_prior_variance.R` is handed the six ratios' variances and no covariances, so it
-# recovers each pair's from `cov(a, b) = (var(a) + var(b) - var(a - b)) / 2`, which needs `a - b`
-# to be one of the six as well. Each ratio is a difference of two log rates, and two of them
-# combine into a third only when they share a rate, so the reconstruction works exactly for the
-# bases whose three ratios are all over one common rate. Four of the sixteen bases are like that,
-# and the parametrization is not one of them.
+# These are the three the models parametrize, and the basis has to be handed its covariances
+# rather than reconstruct them. From variances alone a pair's covariance can only be recovered as
+# `cov(a, b) = (var(a) + var(b) - var(a - b)) / 2`, which needs `a - b` to be one of the six
+# ratios as well, and two ratios combine into a third only when they share a rate. init/deg and
+# elong/splice share none, so `get_ratio_lfc_df` publishes `cov_with_*` instead; see
+# `get_contrast_covariance`.
 #
-# `get_prior_penalty` writes each basis ratio in terms of the parameters through
-# `RATIO_AS_LFC_COMBINATION`, so the penalty is the same quadratic form in the same three linear
-# functionals under either one, and the basis stays a wire format fixed by the column names of
-# `regularization_coefficients.tsv`.
+# `get_prior_penalty` still writes each basis ratio in terms of the parameters through
+# `RATIO_AS_LFC_COMBINATION`, which is now the identity here. It is kept general so that the basis
+# remains a wire format, fixed by the column names of `regularization_coefficients.tsv`, that can
+# move without the parametrization following it.
 LFC_PRIOR_BASIS = (TestedRatio.INIT_OVER_DEG,
-                   TestedRatio.ELONG_OVER_DEG,
+                   TestedRatio.ELONG_OVER_SPLICE,
                    TestedRatio.SPLICE_OVER_DEG)
+
+# The model attributes the basis ratios are built from. `IntronCoverageModel` holds only
+# `lfc_elong_over_splice`, so it has no joint covariance to publish and
+# `estimate_prior_variance.R` fits its prior one ratio at a time. Which of the two applies is read
+# off the model rather than its class, matching how the R side dispatches on what its input holds.
+LFC_PRIOR_BASIS_PARAMETERS = frozenset(
+    attribute for basis_ratio in LFC_PRIOR_BASIS
+    for attribute, _ in RATIO_AS_LFC_COMBINATION[basis_ratio])
 
 
 def get_prior_precision(regularization_coefficients_df: pd.DataFrame,
@@ -514,7 +521,8 @@ def get_prior_precision(regularization_coefficients_df: pd.DataFrame,
     column's per-ratio `lambda`, which penalises whatever directions were estimable and leaves the
     rest effectively free.
     """
-    coefficients = regularization_coefficients_df.set_index(['rate_ratio', 'feature_name'])
+    coefficients = regularization_coefficients_df.set_index(
+        ['rate_ratio', 'feature_name']).sort_index()
     precision = torch.zeros((len(feature_names), len(LFC_PRIOR_BASIS), len(LFC_PRIOR_BASIS)))
     covariance_columns = [f'prior_cov_{ratio.removeprefix("lfc_")}' for ratio in LFC_PRIOR_BASIS]
 
@@ -1247,6 +1255,49 @@ def get_contrast_of_ratio(model: nn.Module,
     return contrast
 
 
+def get_contrast_covariance(parameter_covariance: Optional[ParameterCovariance],
+                            contrast_a: dict[int, float],
+                            contrast_b: dict[int, float]) -> float:
+    """
+    `c_a' Sigma c_b` over the rows the two contrasts touch, or NaN where it is unavailable.
+
+    The covariance between two reported effect sizes, as the same quadratic form with one contrast
+    twice is the variance of a single one -- which is how `get_contrast_wald_results` gets it, so
+    the diagonal of what this returns and the reported standard errors cannot disagree.
+
+    Each contrast is one linear functional of the parameters, as `get_contrast_of_ratio` builds
+    it: keys are rows of the flattened parameter vector and values their coefficients, so a
+    contrast already pins down parameter, design column and intron and the result is a scalar.
+    A plug-in fit's plugged-in values sit past the last row of the parameter table, which this
+    needs no special case for.
+
+    It is published because the empirical Bayes step fits a prior over the three basis ratios
+    jointly and so needs each unit's whole sampling covariance. Reading that off a variance column
+    alone is possible only for a basis whose ratios pairwise share a rate, which the
+    parametrization does not; see `LFC_PRIOR_BASIS`.
+
+    NaN whenever either contrast is empty or touches a row the covariance does not report, which
+    is the rule `get_contrast_wald_results` already applies to a single contrast. A covariance
+    involving an unidentifiable parameter is unavailable, and the ratio it belongs to carries no
+    standard error for that unit either, so it is dropped there regardless.
+    """
+    if parameter_covariance is None or not contrast_a or not contrast_b:
+        return np.nan
+
+    position_in_covariance = {row: position
+                              for position, row in enumerate(parameter_covariance.rows)}
+    rows = sorted(set(contrast_a) | set(contrast_b))
+    if not all(row in position_in_covariance for row in rows):
+        return np.nan
+
+    positions = [position_in_covariance[row] for row in rows]
+    dtype = parameter_covariance.matrix.dtype
+    weights_a = torch.tensor([contrast_a.get(row, 0.0) for row in rows], dtype=dtype)
+    weights_b = torch.tensor([contrast_b.get(row, 0.0) for row in rows], dtype=dtype)
+    submatrix = parameter_covariance.matrix[positions][:, positions]
+    return (weights_a @ submatrix @ weights_b).item()
+
+
 def get_contrast_wald_results(parameter_covariance: Optional[ParameterCovariance],
                               contrast: dict[int, float],
                               lfc: float) -> dict[str, float | bool]:
@@ -1267,21 +1318,15 @@ def get_contrast_wald_results(parameter_covariance: Optional[ParameterCovariance
                         'z_score': np.nan,
                         'p_value_wald': np.nan,
                         'lfc_identifiable': False}
-    if parameter_covariance is None or not contrast:
+    variance = get_contrast_covariance(parameter_covariance, contrast, contrast)
+    # NaN is how `get_contrast_covariance` reports a contrast it cannot evaluate at all, which is
+    # a different thing from one whose variance came out non-positive.
+    if np.isnan(variance):
         return not_identifiable
 
-    position_in_covariance = {row: position
-                              for position, row in enumerate(parameter_covariance.rows)}
-    rows = sorted(contrast)
-    if not all(row in position_in_covariance for row in rows):
-        return not_identifiable
-
-    positions = [position_in_covariance[row] for row in rows]
-    weights = torch.tensor([contrast[row] for row in rows],
-                           dtype=parameter_covariance.matrix.dtype)
-    variance = weights @ parameter_covariance.matrix[positions][:, positions] @ weights
-    # Unclamped for the reason given in add_wald_test_results.
-    standard_error = torch.sqrt(variance).item()
+    # Unclamped, and so NaN once the variance comes out negative, for the reason given in
+    # add_wald_test_results. Spelled out rather than left to `sqrt`, which would warn.
+    standard_error = float(np.sqrt(variance)) if variance >= 0.0 else np.nan
 
     z_score = lfc / standard_error if standard_error > 0 else np.nan
     return {'lfc_se': standard_error,
@@ -1319,6 +1364,13 @@ def get_ratio_lfc_df(model: nn.Module,
     are -- their standard errors need the whole inverse Fisher information rather than one
     diagonal entry of it.
 
+    `cov_with_*` carries each row's covariance with each of `LFC_PRIOR_BASIS`, at the same intron,
+    which is the unit the prior is fitted over. Those are what let `estimate_prior_variance.R`
+    assemble a unit's sampling covariance directly: the basis cannot be recovered from variances
+    alone, for the reason given at `LFC_PRIOR_BASIS`. They are absent for a model whose ratio
+    space is one-dimensional, which has no joint covariance to report, and the R side dispatches
+    on that the same way.
+
     z scores and p values are deliberately left out: a per-column Wald test is not a result the
     pipeline reports, and the tested comparisons already carry theirs in the test results.
 
@@ -1328,6 +1380,10 @@ def get_ratio_lfc_df(model: nn.Module,
     objective is not an information matrix, so it has no standard error to report.
     """
     state_dict = model.state_dict()
+    # Whether this model's ratio space is the full three dimensions, and so whether there is a
+    # joint covariance for the prior to be fitted against.
+    has_prior_basis = all(hasattr(model, attribute)
+                          for attribute in LFC_PRIOR_BASIS_PARAMETERS)
     rows: list[dict] = []
     for ratio_to_report in ratios_to_report:
         lfc_of_ratio = get_lfc_of_lfc_combination(state_dict, ratio_to_report.lfc_combination,
@@ -1339,13 +1395,25 @@ def get_ratio_lfc_df(model: nn.Module,
                    'feature_name': feature_name,
                    'lfc': lfc}
             if with_standard_errors:
-                contrast = get_contrast_of_ratio(model, ratio_to_report.lfc_combination,
+                def get_contrast(lfc_combination: LFCCombination) -> dict[int, float]:
+                    return get_contrast_of_ratio(model, lfc_combination,
                                                  lfc_column_positive=feature_name,
                                                  lfc_column_negative=np.nan,
                                                  intron_index=ratio_to_report.intron_index)
+
+                contrast = get_contrast(ratio_to_report.lfc_combination)
                 wald_results = get_contrast_wald_results(parameter_covariance, contrast, lfc)
                 row['lfc_se'] = wald_results['lfc_se']
                 row['lfc_identifiable'] = wald_results['lfc_identifiable']
+                if has_prior_basis:
+                    # This ratio's covariance with each basis ratio, at the same intron, that
+                    # being the unit the prior is fitted over. For a basis ratio the entry
+                    # against itself is its own variance, so the three rows of a unit's
+                    # sampling covariance are read straight off these columns.
+                    for basis_ratio in LFC_PRIOR_BASIS:
+                        row[f'cov_with_{basis_ratio}'] = get_contrast_covariance(
+                            parameter_covariance, contrast,
+                            get_contrast(RATIO_AS_LFC_COMBINATION[basis_ratio]))
             rows.append(row)
     return pd.DataFrame(rows)
 
