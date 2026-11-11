@@ -509,33 +509,100 @@ LFC_PRIOR_BASIS_PARAMETERS = frozenset(
     for attribute, _ in RATIO_AS_LFC_COMBINATION[basis_ratio])
 
 
+def get_frozen_basis_ratios(model: nn.Module) -> frozenset[TestedRatio]:
+    """
+    Which of `LFC_PRIOR_BASIS` the model holds fixed rather than estimates.
+
+    A plugged-in value is registered as a buffer, so it is absent from `named_parameters()`, and a
+    basis ratio counts as frozen when every parameter it is built from is. Under the current basis
+    that is one parameter per ratio, so a ratio is either wholly frozen or wholly estimated. A
+    basis built from both at once has no well defined prior over what is left, since the penalty
+    is a quadratic form in the ratios rather than in the parameters, so it is rejected here rather
+    than given one of the two readings.
+    """
+    estimated = {name for name, _ in model.named_parameters()}
+    frozen = set()
+    for basis_ratio in LFC_PRIOR_BASIS:
+        attributes = [attribute for attribute, _ in RATIO_AS_LFC_COMBINATION[basis_ratio]]
+        if all(attribute not in estimated for attribute in attributes):
+            frozen.add(basis_ratio)
+        elif any(attribute not in estimated for attribute in attributes):
+            raise ValueError(
+                f'{basis_ratio} mixes estimated and plugged-in parameters, which leaves no prior '
+                f'over the remaining basis ratios.')
+    return frozenset(frozen)
+
+
 def get_prior_precision(regularization_coefficients_df: pd.DataFrame,
                         feature_names: list[str],
+                        frozen_basis_ratios: frozenset[TestedRatio] = frozenset(),
                         device: str = 'cpu') -> torch.Tensor:
     """
-    The inverse prior covariance of the three basis ratios, per design column.
+    The inverse prior covariance of the estimated basis ratios, per design column.
 
-    Reads the covariance `estimate_prior_variance.R` fitted jointly over those three and inverts
-    it, giving the matrix the penalty is a quadratic form in. A design column whose covariance is
-    incomplete -- some ratio was not estimable there -- falls back to the diagonal built from that
-    column's per-ratio `lambda`, which penalises whatever directions were estimable and leaves the
-    rest effectively free.
+    Reads the covariance `estimate_prior_variance.R` fitted jointly over the three basis ratios
+    and inverts it, giving the matrix the penalty is a quadratic form in. A design column whose
+    covariance is unusable -- incomplete, because some ratio was not estimable there, or not
+    positive definite -- falls back to the diagonal built from that column's per-ratio `lambda`,
+    which penalises whatever directions were usable and leaves the rest effectively free.
+
+    `frozen_basis_ratios` are the ones a plug-in holds fixed. Their rows and columns are dropped
+    before the inverse and come back as zeros, so the penalty is the **marginal** prior over the
+    ratios still being estimated and `get_prior_penalty` needs no special case: the frozen value
+    still enters its quadratic form, against zeros.
+
+    The marginal rather than the prior conditioned on the frozen value, which inverting the whole
+    covariance would give instead. Conditioning is right for a value that is known, and a
+    plugged-in one is an estimate: against a plugged-in value carrying sampling variance `V1`, the
+    cross term the conditional prior applies is attenuated by `Psi / (Psi + V1)`, where `Psi` is
+    that ratio's prior variance. `V1` is routinely of the prior's own size or larger, the coverage
+    shape of one gene's introns being a far thinner slice of the data than the whole dataset the
+    prior was fitted over, so the unattenuated cross term moves the shrinkage target by multiples
+    of what the data support, and it moves it most for the genes whose plugged-in value is least
+    certain. Dropping the term is the other end of the same formula, at `V1` large, and it keeps
+    the target at zero, which is what `estimate_prior_variance.R` fits a prior covariance of
+    `Psi + mu mu'` for.
+
+    Dropping the rows before the finiteness check is also what lets a design column where the
+    frozen ratio was not estimable keep a real prior over the rest, rather than falling back to
+    the diagonal for a column it no longer reads.
     """
     coefficients = regularization_coefficients_df.set_index(
         ['rate_ratio', 'feature_name']).sort_index()
-    precision = torch.zeros((len(feature_names), len(LFC_PRIOR_BASIS), len(LFC_PRIOR_BASIS)))
-    covariance_columns = [f'prior_cov_{ratio.removeprefix("lfc_")}' for ratio in LFC_PRIOR_BASIS]
+    precision = np.zeros((len(feature_names), len(LFC_PRIOR_BASIS), len(LFC_PRIOR_BASIS)))
+    estimated_indices = [index for index, ratio in enumerate(LFC_PRIOR_BASIS)
+                         if ratio not in frozen_basis_ratios]
+    block = np.ix_(estimated_indices, estimated_indices)
+    covariance_columns = [f'prior_cov_{LFC_PRIOR_BASIS[index].removeprefix("lfc_")}'
+                          for index in estimated_indices]
 
     for feature_index, feature_name in enumerate(feature_names):
-        rows = [coefficients.loc[(ratio, feature_name)] for ratio in LFC_PRIOR_BASIS]
-        covariance = np.array([[row[column] for column in covariance_columns] for row in rows],
-                              dtype=np.float64)
-        if np.isfinite(covariance).all():
-            precision[feature_index] = torch.from_numpy(np.linalg.inv(covariance)).float()
+        rows = [coefficients.loc[(LFC_PRIOR_BASIS[index], feature_name)]
+                for index in estimated_indices]
+        covariance = torch.from_numpy(np.array(
+            [[row[column] for column in covariance_columns] for row in rows], dtype=np.float64))
+        # The same two tests the Fisher information goes through, and definite rather than
+        # semidefinite because this matrix is inverted whole, where a flat direction leaves it
+        # singular. The condition is reachable: `estimate_prior_variance.R` flags it as a
+        # degenerate prior but fills in the covariance columns before doing so, so the numbers
+        # arrive finite. It is tested here rather than read off that status because under a
+        # plug-in the matrix inverted is a submatrix, which can be definite where the whole is
+        # not. A narrow but positive direction passes and is inverted as it stands, giving a
+        # precision that constrains the refit hard along it, which is the prior that was fitted.
+        inverse = (try_invert(covariance)
+                   if torch.isfinite(covariance).all() and is_positive_definite(covariance)
+                   else None)
+        if inverse is not None:
+            precision[feature_index][block] = inverse.numpy()
         else:
-            lambdas = [row['lambda'] for row in rows]
-            precision[feature_index] = torch.diag(2 * torch.tensor(lambdas, dtype=torch.float32))
-    return precision.to(device)
+            # A ratio whose fitted prior had no width at all arrives with an infinite `lambda`,
+            # which would make the penalty and so the refit's loss non-finite. R reports that as
+            # a degenerate prior rather than as a finding, so it is left unpenalised here, the
+            # same answer as for a ratio there was nothing to learn a prior from.
+            lambdas = np.array([row['lambda'] for row in rows], dtype=np.float64)
+            precision[feature_index][estimated_indices, estimated_indices] = np.where(
+                np.isfinite(lambdas), 2 * lambdas, 0.0)
+    return torch.from_numpy(precision).float().to(device)
 
 
 def get_prior_penalty(model: RNAKineticsModel, prior_precision: torch.Tensor) -> torch.Tensor:
@@ -807,22 +874,39 @@ def is_positive_semidefinite(matrix: torch.Tensor) -> bool:
     return bool(eigenvalues[0] >= -get_eigenvalue_tolerance(eigenvalues))
 
 
-def invert_information(information: torch.Tensor) -> Optional[torch.Tensor]:
+def is_positive_definite(matrix: torch.Tensor) -> bool:
     """
-    The covariance an information matrix implies, or None where it cannot be inverted.
+    Whether a symmetric matrix carries curvature in every direction, to the rank test's tolerance.
 
-    A true inverse rather than a pseudoinverse, although both callers pass a submatrix they have
-    already established is positive definite. A pseudoinverse zeroes whatever singular value falls
-    below its tolerance, which reports a *smaller* variance for a direction the data barely
-    determine, as though that direction were pinned rather than unknown. A true inverse reports a
-    large one instead, and refuses outright once the matrix is singular, so the failure is visible
-    in the output rather than hidden in it.
+    For a caller that inverts the matrix whole, where a flat direction leaves it singular.
+    `is_positive_semidefinite` passes such a direction on purpose, which is what a caller wanting
+    definiteness needs when it first restricts to a subspace of full rank.
 
-    None rather than the exception, so one gene whose submatrix is numerically singular costs its
-    own Wald results and not its whole chunk's.
+    An empty matrix fails, there being no inverse of it to go on with.
+    """
+    if matrix.shape[0] == 0:
+        return False
+    eigenvalues = torch.linalg.eigvalsh(matrix)
+    return bool(eigenvalues[0] > get_eigenvalue_tolerance(eigenvalues))
+
+
+def try_invert(matrix: torch.Tensor) -> Optional[torch.Tensor]:
+    """
+    A matrix's inverse, or None where it has none. Callers establish definiteness themselves.
+
+    A true inverse rather than a pseudoinverse. A pseudoinverse zeroes whatever singular value
+    falls below its tolerance, turning a direction the matrix barely determines into one it pins
+    exactly, and each caller here would read that the wrong way round. Inverting an information
+    matrix, it reports a *smaller* variance for a direction the data say least about. Inverting a
+    prior covariance, it reports *no* penalty along the direction the prior constrains hardest. A
+    true inverse gives a large value instead, and refuses outright once the matrix is singular, so
+    the failure is visible in the output rather than hidden in it.
+
+    None rather than the exception, so a matrix that is numerically singular costs only what was
+    being read off it: one gene's Wald results, or one design column's joint prior.
     """
     try:
-        return torch.linalg.inv(information)
+        return torch.linalg.inv(matrix)
     except torch.linalg.LinAlgError:
         return None
 
@@ -867,7 +951,7 @@ def get_parameter_covariance(
     if not is_positive_semidefinite(identifiable_subset):
         return None
 
-    matrix = invert_information(identifiable_subset)
+    matrix = try_invert(identifiable_subset)
     if matrix is None:
         return None
 
@@ -1073,7 +1157,7 @@ def get_two_stage_parameter_covariance(
     rows = np.concatenate([covariance_free.rows,
                            np.arange(num_free_parameters, hessian_matrix.shape[0])])
     identifiable = get_rows_outside_null_space(joint_information, data_dtype)
-    matrix = invert_information(joint_information[identifiable][:, identifiable])
+    matrix = try_invert(joint_information[identifiable][:, identifiable])
     if matrix is None:
         return None
 
@@ -1745,17 +1829,41 @@ def get_regularized_rna_kinetics_model_results(gene_data: GeneData,
                                                intron_specific_lfc: bool,
                                                hot_start_state_dict: StateDict,
                                                regularization_coefficients_df: pd.DataFrame,
+                                               plug_in_coverage_fits: Optional[
+                                                   list[PlugInCoverageFit]] = None,
                                                device='cpu'
                                                ) -> RegularizedFitResults:
+    """
+    Refit the per-gene model under the prior the first fit was used to estimate.
+
+    `plug_in_coverage_fits` has to be the same fits the unregularized model was given, so that the
+    refit is the same model and the hot start lands in it. Passing none where the first fit had
+    them would silently turn the plugged-in values back into free parameters: a state dict names
+    them identically either way, so `load_state_dict` accepts it and the refit then estimates
+    against the count arm what stage one read off the coverage shape.
+
+    The prior a plug-in is refitted under is the marginal one over the ratios still being
+    estimated, which `get_prior_precision` builds from `get_frozen_basis_ratios` here; the reason
+    is given there. `get_prior_penalty` itself needs no special case either way.
+    """
     gene_data = gene_data.to(device)
     dataset_metadata = dataset_metadata.to(device)
+
+    plug_in_coverage: Optional[PlugInCoverage] = None
+    if plug_in_coverage_fits is not None:
+        plug_in_coverage = PlugInCoverage.from_fits(plug_in_coverage_fits,
+                                                    gene_data.intron_names,
+                                                    intron_specific_lfc).to(device)
     model_regularized = RNAKineticsModel(feature_names=dataset_metadata.feature_names,
                                          intron_names=gene_data.intron_names,
-                                         intron_specific_lfc=intron_specific_lfc).to(device)
+                                         intron_specific_lfc=intron_specific_lfc,
+                                         plug_in_coverage=plug_in_coverage).to(device)
     model_regularized.load_state_dict(hot_start_state_dict)
 
     prior_precision = get_prior_precision(regularization_coefficients_df,
-                                          model_regularized.feature_names, device)
+                                          model_regularized.feature_names,
+                                          get_frozen_basis_ratios(model_regularized),
+                                          device)
 
     optimizer_regularized = make_lbfgs_optimizer(model_regularized)
     closure_regularized, evaluate_loss_regularized = _make_rna_kinetics_closures(
