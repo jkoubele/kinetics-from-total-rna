@@ -49,6 +49,7 @@ if __name__ == "__main__":
             dataset_metadata=dataset_metadata,
             hot_start_state_dict=model_state_dict,
             regularization_coefficients_df=regularization_coefficients_df,
+            intron_specific_lfc=cache_for_regularization.intron_specific_lfc,
             device=device,
         )
         regularized_model_params_list.append(results.model_parameters)

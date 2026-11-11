@@ -127,8 +127,21 @@ The six resulting models are listed below. Each cell of the table gives the para
 | Granularity | RNA kinetics model | Intron coverage model |
 | --- | --- | --- |
 | **Global**, one effect for the whole dataset | *fit_global_rna_kinetics_model* | *fit_global_intron_coverage_model* |
-| **Per gene**, one effect per gene, shared by its introns | *fit_rna_kinetics_model* | *fit_gene_specific_intron_coverage_model* |
+| **Per gene**, one effect per gene, shared by its introns | *fit_gene_specific_rna_kinetics_model* | *fit_gene_specific_intron_coverage_model* |
 | **Per intron**, a separate effect for every intron | *fit_intron_specific_rna_kinetics_model* | *fit_intron_specific_intron_coverage_model* |
+
+An RNA kinetics model is fitted in two stages. The intron coverage model of the same granularity
+is fitted first, which identifies the elongation over splicing effect from the shape of the intron
+coverage alone, and that estimate is then held fixed while the read counts are fitted. So enabling
+an RNA kinetics model also enables the intron coverage model it reads; if you left that one off,
+the pipeline switches it on and says so. The standard errors of the second stage account for the
+first stage having been estimated rather than known.
+
+You can instead fit both stages at once, by setting ```use_plug_in_coverage``` to false. We do not
+recommend it: one gene's intron coverage carries far less information about the elongation over
+splicing effect than its read counts carry about everything else, so a joint fit lets the counts
+pull that effect away from what the coverage shape supports. Those results are written to a
+separate ```*_joint_likelihood``` folder, so the two can be compared side by side.
 
 We recommend starting with the global and per-gene models of both families, which is also the
 default setting in the [dataset_params_template.yaml](dataset_params_template.yaml) file. The global

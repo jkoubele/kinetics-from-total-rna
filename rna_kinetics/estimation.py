@@ -34,7 +34,11 @@ class TrainingResults:
 class CacheForRegularization:
     training_input_per_gene: list[tuple[GeneData, StateDict]]
     dataset_metadata: DatasetMetadata
-    intron_specific_lfc: Optional[bool] = None  # RNAKineticsModel only: LFC parameter shape
+    # Whether the LFC belongs to one intron. For `RNAKineticsModel` it is the LFC parameter's
+    # shape; for `IntronCoverageModel` it is whether the fit was per intron, which decides the
+    # name the LFC is reported under. Required, so that the refit reads the granularity the fit
+    # declared rather than inferring it from the data it was handed.
+    intron_specific_lfc: bool
 
 
 class ModelFitResults(NamedTuple):
@@ -1935,6 +1939,7 @@ def get_intron_coverage_model_results(
         dataset_metadata: DatasetMetadata,
         intron_names: list[str],
         is_global_model: bool = False,
+        intron_specific_lfc: bool = False,
         device: str = 'cpu',
         verbose: bool = False,
 ) -> ModelFitResults:
@@ -1946,13 +1951,17 @@ def get_intron_coverage_model_results(
     are then tens of thousands of per-intron intercepts against that one LFC and optimising the
     LFC alone first is far better conditioned. And no Wald test is computed, because the Fisher
     information would be one row and column per intercept, making it very large.
+
+    `intron_specific_lfc` says this call is one intron's fit, which is what decides whether the
+    LFC is reported under that intron's name. It is declared rather than read off the length of
+    `intron_names`, so that a gene with one intron is still a gene-wide fit.
     """
     coverage = coverage.to(device)
     dataset_metadata = dataset_metadata.to(device)
 
-    # The intron the LFC is reported under; None when it is shared across several introns, which
-    # is always the case for the global model.
-    lfc_intron_name = intron_names[0] if len(intron_names) == 1 else None
+    # The intron the LFC is reported under; None wherever it is shared, which is every fit but a
+    # per-intron one, the global model included.
+    lfc_intron_name = intron_names[0] if intron_specific_lfc else None
 
     # No lrt_specification: this model's single LFC is the only thing it can restrict.
     lrt_inputs = [LRTInputs(lrt_metadata_row=row,
@@ -1978,7 +1987,8 @@ def get_intron_coverage_model_results(
 
     def build_full_model() -> IntronCoverageModel:
         return IntronCoverageModel(feature_names=dataset_metadata.feature_names,
-                                   intron_names=intron_names).to(device)
+                                   intron_names=intron_names,
+                                   intron_specific_lfc=intron_specific_lfc).to(device)
 
     def fit_full_from_scratch() -> tuple[IntronCoverageModel, TrainingResults]:
         model = build_full_model()
@@ -1991,6 +2001,7 @@ def get_intron_coverage_model_results(
         model_reduced = IntronCoverageModel(
             feature_names=[f'reduced_feature_{i}' for i in range(reduced_matrix.shape[1])],
             intron_names=intron_names,
+            intron_specific_lfc=intron_specific_lfc,
         ).to(device)
         set_reduced_coverage_model_from_full(model_reduced, reduced_matrix,
                                             model_full, dataset_metadata.design_matrix)
@@ -2302,6 +2313,7 @@ def get_regularized_intron_coverage_model_results(
         dataset_metadata: DatasetMetadata,
         hot_start_state_dict: StateDict,
         regularization_coefficients_df: pd.DataFrame,
+        intron_specific_lfc: bool = False,
         device: str = 'cpu',
 ) -> RegularizedFitResults:
     coverage = input_data.coverage.to(device)
@@ -2311,6 +2323,7 @@ def get_regularized_intron_coverage_model_results(
     model_regularized = IntronCoverageModel(
         feature_names=dataset_metadata.feature_names,
         intron_names=input_data.intron_names,
+        intron_specific_lfc=intron_specific_lfc,
     ).to(device)
     model_regularized.load_state_dict(hot_start_state_dict)
 
@@ -2335,9 +2348,9 @@ def get_regularized_intron_coverage_model_results(
     model_param_df[
         'training_converged_within_max_epochs_regularized_model'] = training_results_regularized.converged_within_max_epochs
 
-    # One intron means the shared LFC is that intron's, so it is reported under its name -- the
-    # same rule `IntronCoverageModel.get_param_df` follows.
-    lfc_intron_name = (input_data.intron_names[0] if len(input_data.intron_names) == 1 else None)
+    # The same rule `IntronCoverageModel.get_param_df` follows, and it has to be: this table and
+    # `model_parameters.tsv` are joined on `intron_name` by `merge_regularization.R`.
+    lfc_intron_name = input_data.intron_names[0] if intron_specific_lfc else None
     ratio_lfc_df = get_ratio_lfc_df(
         model_regularized, parameter_covariance=None, with_standard_errors=False,
         ratios_to_report=[RatioToReport(ratio=LFCParameter.ELONG_OVER_SPLICE,

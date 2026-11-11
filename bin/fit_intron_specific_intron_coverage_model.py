@@ -55,6 +55,7 @@ if __name__ == "__main__":
             coverage=intron_data.coverage,
             dataset_metadata=dataset_metadata,
             intron_names=intron_data.intron_names,
+            intron_specific_lfc=True,
         )
         model_param_df = results.model_parameters.reset_index(drop=True)
         model_param_df['gene_name'] = intron_data.gene_name
@@ -80,6 +81,9 @@ if __name__ == "__main__":
     cache_for_regularization = CacheForRegularization(
         training_input_per_gene=training_inputs,
         dataset_metadata=dataset_metadata,
+        # So the refit reports the LFC under the same intron's name this fit did, which is what
+        # `merge_regularization.R` joins the two tables on.
+        intron_specific_lfc=True,
     )
     torch.save(cache_for_regularization,
                args.output_folder / f'cache_for_regularization{args.output_name_suffix}.pt')

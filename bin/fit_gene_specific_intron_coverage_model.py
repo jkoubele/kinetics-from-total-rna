@@ -117,6 +117,8 @@ if __name__ == "__main__":
     cache_for_regularization = CacheForRegularization(
         training_input_per_gene=list(zip(gene_data_list, state_dicts_list)),
         dataset_metadata=dataset_metadata,
+        # One fit over the gene's introns, so its LFC is reported under no intron name.
+        intron_specific_lfc=False,
     )
     torch.save(cache_for_regularization,
                args.output_folder / f'cache_for_regularization{args.output_name_suffix}.pt')

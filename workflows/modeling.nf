@@ -411,6 +411,28 @@ process MergeRegularization {
     """
 }
 
+process AddCoverageArmTestResults {
+    // Not published: `MergeRegularization` already publishes raw_test_results.tsv in this folder,
+    // and the table this one produces is read by the postprocessing that publishes the results.
+    input:
+    tuple(
+        path(test_results),
+        path(coverage_test_results, stageAs: 'coverage/*')
+    )
+
+    output:
+    path("test_results_with_coverage_arm.tsv"), emit: raw_test_results
+
+    script:
+    """
+    add_coverage_arm_test_results.R \
+    --test_results $test_results \
+    --coverage_test_results $coverage_test_results \
+    --output_file test_results_with_coverage_arm.tsv
+    """
+}
+
+
 process PostprocessResultsAndPlot {
     publishDir { "${params.outdir}/modeling/${params.model_run_id}/${model_type_subfolder}" }, mode: 'copy'
 
@@ -466,6 +488,7 @@ workflow gene_specific_rna_kinetics_model_subworkflow {
         isoform_length_factors
         coverage_files
         plug_in_coverage_fits
+        coverage_test_results
         use_plug_in_coverage
 
     main:
@@ -522,7 +545,15 @@ workflow gene_specific_rna_kinetics_model_subworkflow {
             model_subfolder
         )
 
-        PostprocessResultsAndPlot(merge_regularization_output.raw_test_results, 'rna_kinetics', model_subfolder)
+        // Under the plug-in, lfc_elong_over_splice has no test here, so the coverage model's
+        // own rows for it are added and the table covers all six ratios either way.
+        def test_results = use_plug_in_coverage
+            ? AddCoverageArmTestResults(
+                merge_regularization_output.raw_test_results.combine(coverage_test_results)
+              ).raw_test_results
+            : merge_regularization_output.raw_test_results
+
+        PostprocessResultsAndPlot(test_results, 'rna_kinetics', model_subfolder)
 }
 
 
@@ -539,6 +570,7 @@ workflow intron_specific_rna_kinetics_model_subworkflow {
         isoform_length_factors
         coverage_files
         plug_in_coverage_fits
+        coverage_test_results
         use_plug_in_coverage
 
     main:
@@ -595,7 +627,15 @@ workflow intron_specific_rna_kinetics_model_subworkflow {
             model_subfolder
         )
 
-        PostprocessResultsAndPlot(merge_regularization_output.raw_test_results, 'rna_kinetics', model_subfolder)
+        // Under the plug-in, lfc_elong_over_splice has no test here, so the coverage model's
+        // own rows for it are added and the table covers all six ratios either way.
+        def test_results = use_plug_in_coverage
+            ? AddCoverageArmTestResults(
+                merge_regularization_output.raw_test_results.combine(coverage_test_results)
+              ).raw_test_results
+            : merge_regularization_output.raw_test_results
+
+        PostprocessResultsAndPlot(test_results, 'rna_kinetics', model_subfolder)
 }
 
 
@@ -763,6 +803,7 @@ workflow global_rna_kinetics_model_subworkflow {
         isoform_length_factors
         coverage_files
         plug_in_coverage_fits
+        coverage_test_results
         use_plug_in_coverage
 
     main:
@@ -792,7 +833,12 @@ workflow global_rna_kinetics_model_subworkflow {
                 .map { fit_input -> fit_input + [model_subfolder] }
         )
 
-        PostprocessGlobalResultsAndPlot(fit_output.test_results, 'global_rna_kinetics', model_subfolder)
+        def test_results = use_plug_in_coverage
+            ? AddCoverageArmTestResults(
+                fit_output.test_results.combine(coverage_test_results)).raw_test_results
+            : fit_output.test_results
+
+        PostprocessGlobalResultsAndPlot(test_results, 'global_rna_kinetics', model_subfolder)
 }
 
 
@@ -950,6 +996,7 @@ workflow modeling_workflow {
                 coverage_files_input,
                 use_plug_in_coverage ? gene_specific_coverage_output.plug_in_coverage_fits
                     : channel.empty(),
+                use_plug_in_coverage ? gene_specific_coverage_output.raw_test_results : channel.empty(),
                 use_plug_in_coverage
             )
         }
@@ -968,6 +1015,7 @@ workflow modeling_workflow {
                 coverage_files_input,
                 use_plug_in_coverage ? intron_specific_coverage_output.plug_in_coverage_fits
                     : channel.empty(),
+                use_plug_in_coverage ? intron_specific_coverage_output.raw_test_results : channel.empty(),
                 use_plug_in_coverage
             )
         }
@@ -986,6 +1034,7 @@ workflow modeling_workflow {
                 coverage_files_input,
                 use_plug_in_coverage ? global_coverage_output.plug_in_coverage_fits
                     : channel.empty(),
+                use_plug_in_coverage ? global_coverage_output.raw_test_results : channel.empty(),
                 use_plug_in_coverage
             )
         }

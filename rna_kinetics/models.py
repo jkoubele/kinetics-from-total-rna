@@ -748,18 +748,28 @@ class IntronCoverageModel(nn.Module):
 
     def __init__(self,
                  feature_names: list[str],
-                 intron_names: list[str]):
+                 intron_names: list[str],
+                 intron_specific_lfc: bool = False):
         super().__init__()
         self.feature_names = feature_names
         self.intron_names = intron_names
+        # Whether the LFC belongs to one intron by design, which is what decides the name it is
+        # reported under. Declared rather than inferred from the number of introns, because a gene
+        # whose introns happen to number one would otherwise be read as a per-intron fit and
+        # report a gene-wide LFC under that intron's name. `RNAKineticsModel` takes the same
+        # argument and asks the same question of it.
+        if intron_specific_lfc and len(intron_names) != 1:
+            raise ValueError(f'An intron-specific LFC belongs to one intron, got {intron_names}.')
+        self.intron_specific_lfc = intron_specific_lfc
 
         num_features = len(feature_names)
         num_introns = len(intron_names)
 
         # One LFC, shared across whatever introns the model was given. The second axis is a
         # singleton so that the term broadcasts against the per-intron intercept; it is never an
-        # intron axis. Fitting this model per intron means constructing it with that one intron,
-        # and then its LFC is reported under that intron's name -- see get_param_df.
+        # intron axis. Fitting this model per intron means constructing it with that one intron
+        # and `intron_specific_lfc`, and then its LFC is reported under that intron's name -- see
+        # get_param_df.
         #
         # The name is shared with `RNAKineticsModel`'s parameter of the same ratio deliberately:
         # that model's nascent fraction responds to exactly this LFC, so the two estimate the same
@@ -781,9 +791,10 @@ class IntronCoverageModel(nn.Module):
         return pi
 
     def get_param_df(self) -> pd.DataFrame:
-        # Given a single intron, the shared LFC is that intron's LFC, so it is reported under its
-        # name. Given several, it is shared across them and reported unnamed.
-        lfc_intron_axis = 'intron' if len(self.intron_names) == 1 else None
+        # Fitted per intron, the LFC is that intron's and is reported under its name. Fitted over
+        # a gene's introns or the whole dataset's, it is shared across them and reported unnamed,
+        # however many of them there turn out to be.
+        lfc_intron_axis = 'intron' if self.intron_specific_lfc else None
         return build_param_df(self, {
             'lfc_elong_over_splice': ('feature', lfc_intron_axis),
             'intercept_pi_logit': ('intron',),
