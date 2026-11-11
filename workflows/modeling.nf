@@ -84,7 +84,8 @@ process FitRNAKineticsModel {
         path(library_size_factors),
         path(isoform_length_factors),
         path(coverage_parquet_files),
-        val(intron_specific_lfc)
+        val(intron_specific_lfc),
+        path(plug_in_coverage_fits)
     )
 
     output:
@@ -96,6 +97,9 @@ process FitRNAKineticsModel {
 //     publishDir "${params.outdir}/modeling/${params.model_run_id}/processing_chunks/model_results_chunks/${chunk_name}", mode: 'copy'
 
     script:
+    // Empty where the joint likelihood is being fitted instead, which stages no file and
+    // leaves the argument off, rather than passing a path the script would have to ignore.
+    def plug_in_argument = plug_in_coverage_fits ? "--plug_in_coverage_fits ${plug_in_coverage_fits}" : ''
     """
     export PYTHONPATH='${baseDir}'\${PYTHONPATH:+:\$PYTHONPATH}
     fit_rna_kinetics_model.py \
@@ -110,6 +114,7 @@ process FitRNAKineticsModel {
     --lrt_metadata ${lrt_metadata} \
     --reduced_matrices_folder ${reduced_matrices_folder} \
     --intron_specific_lfc ${intron_specific_lfc} \
+    ${plug_in_argument} \
     --output_folder . \
     --output_name_suffix _${chunk_name}
     """
@@ -137,6 +142,7 @@ process FitGeneSpecificIntronCoverageModel {
     path("ratio_lfcs*.tsv"), emit: ratio_lfcs_chunk
     path("test_results*.tsv"), emit: test_results_chunk
     tuple path("cache_for_regularization*.pt"), val(chunk_name), emit: cache_for_regularization
+    path("plug_in_coverage_fits*.pt"), emit: plug_in_coverage_fits_chunk
 
     script:
     """
@@ -174,6 +180,7 @@ process FitIntronSpecificIntronCoverageModel {
     path("ratio_lfcs*.tsv"), emit: ratio_lfcs_chunk
     path("test_results*.tsv"), emit: test_results_chunk
     tuple path("cache_for_regularization*.pt"), val(chunk_name), emit: cache_for_regularization
+    path("plug_in_coverage_fits*.pt"), emit: plug_in_coverage_fits_chunk
 
     script:
     """
@@ -206,6 +213,7 @@ process FitGlobalIntronCoverageModel {
     output:
     path("model_parameters.tsv"), emit: model_parameters
     path("test_results_raw.tsv"), emit: test_results
+    path("plug_in_coverage_fits.pt"), emit: plug_in_coverage_fits
 
     script:
     """
@@ -222,7 +230,8 @@ process FitGlobalIntronCoverageModel {
 }
 
 process FitGlobalRNAKineticsModel {
-    publishDir "${params.outdir}/modeling/${params.model_run_id}/global_rna_kinetics_model", mode: 'copy'
+    publishDir { "${params.outdir}/modeling/${params.model_run_id}/${model_type_subfolder}" },
+     mode: 'copy'
 
     input:
     tuple(
@@ -235,7 +244,9 @@ process FitGlobalRNAKineticsModel {
         path(intron_counts_matrix),
         path(library_size_factors),
         path(isoform_length_factors),
-        path(coverage_parquet_files)
+        path(coverage_parquet_files),
+        path(plug_in_coverage_fits),
+        val(model_type_subfolder)
     )
 
     output:
@@ -243,6 +254,9 @@ process FitGlobalRNAKineticsModel {
     path("test_results_raw.tsv"), emit: test_results
 
     script:
+    // Empty where the joint likelihood is being fitted instead, which stages no file and
+    // leaves the argument off, rather than passing a path the script would have to ignore.
+    def plug_in_argument = plug_in_coverage_fits ? "--plug_in_coverage_fits ${plug_in_coverage_fits}" : ''
     """
     export PYTHONPATH='${baseDir}'\${PYTHONPATH:+:\$PYTHONPATH}
     fit_global_rna_kinetics_model.py \
@@ -255,7 +269,8 @@ process FitGlobalRNAKineticsModel {
     --isoform_length_factors $isoform_length_factors \
     --coverage_data_folder . \
     --lrt_metadata ${lrt_metadata} \
-    --reduced_matrices_folder ${reduced_matrices_folder}
+    --reduced_matrices_folder ${reduced_matrices_folder} \
+    ${plug_in_argument}
     mv test_results.tsv test_results_raw.tsv
     """
 }
@@ -289,6 +304,23 @@ process MergeModelResultChunks {
 }
 
 
+process MergePlugInCoverageFits {
+    input:
+    path plug_in_coverage_fits_chunks
+
+    output:
+    path("plug_in_coverage_fits.pt"), emit: plug_in_coverage_fits
+
+    script:
+    """
+    export PYTHONPATH='${baseDir}'\${PYTHONPATH:+:\$PYTHONPATH}
+    merge_plug_in_coverage_fits.py \
+    --input_folder . \
+    --output_file plug_in_coverage_fits.pt
+    """
+}
+
+
 process EstimatePriorVariance {
     publishDir { "${params.outdir}/modeling/${params.model_run_id}/${model_type_subfolder}" }, mode: 'copy'
 
@@ -311,7 +343,8 @@ process FitRegularizedRNAKineticsModel {
     tuple(
         path(cache_for_regularization),
         val(chunk_name),
-        path(regularization_coefficients)
+        path(regularization_coefficients),
+        path(plug_in_coverage_fits)
     )
 
     output:
@@ -321,11 +354,15 @@ process FitRegularizedRNAKineticsModel {
 //     publishDir "${params.outdir}/modeling/${params.model_run_id}/processing_chunks/regularized_model_results_chunks/${chunk_name}", mode: 'copy'
 
     script:
+    // Empty where the joint likelihood is being fitted instead, which stages no file and
+    // leaves the argument off, rather than passing a path the script would have to ignore.
+    def plug_in_argument = plug_in_coverage_fits ? "--plug_in_coverage_fits ${plug_in_coverage_fits}" : ''
     """
     export PYTHONPATH='${baseDir}'\${PYTHONPATH:+:\$PYTHONPATH}
     fit_regularized_rna_kinetics_model.py \
     --cache_for_regularization $cache_for_regularization \
     --regularization_coefficients $regularization_coefficients \
+    ${plug_in_argument} \
     --output_name_suffix _$chunk_name
     """
 }
@@ -428,11 +465,16 @@ workflow gene_specific_rna_kinetics_model_subworkflow {
         library_size_factors
         isoform_length_factors
         coverage_files
+        plug_in_coverage_fits
+        use_plug_in_coverage
 
     main:
-        def model_subfolder = 'gene_specific_rna_kinetics_model'
+        // The joint likelihood writes to its own folder, so which estimator produced
+        // a set of results is visible from the results themselves.
+        def model_subfolder = use_plug_in_coverage ? 'gene_specific_rna_kinetics_model'
+            : 'gene_specific_rna_kinetics_model_joint_likelihood'
 
-        def model_input = gene_names_chunks
+        def model_input_without_coverage_fits = gene_names_chunks
             .flatten()
             .map{ file -> tuple(file, file.baseName)}
             .combine(modeled_introns)
@@ -445,7 +487,13 @@ workflow gene_specific_rna_kinetics_model_subworkflow {
             .combine(isoform_length_factors)
             // Wrapping coverage_files in an extra list prevents unwanted flattening behavior in .combine()
             .combine(coverage_files.map { file_list -> tuple([file_list]) })
-            .map { it + [false] }
+            .map { chunk_input -> chunk_input + [false] }
+
+        // The plug-in route attaches the merged coverage fits. The joint one attaches an empty
+        // list, which stages no file and so leaves the argument off the command line.
+        def model_input = use_plug_in_coverage
+            ? model_input_without_coverage_fits.combine(plug_in_coverage_fits)
+            : model_input_without_coverage_fits.map { chunk_input -> chunk_input + [[]] }
 
         def fit_output = FitRNAKineticsModel(model_input)
 
@@ -458,9 +506,13 @@ workflow gene_specific_rna_kinetics_model_subworkflow {
 
         def prior_variance_out = EstimatePriorVariance(model_result_merged.ratio_lfcs, model_subfolder)
 
+        def regularized_input = fit_output.cache_for_regularization
+            .combine(prior_variance_out.regularization_coefficients)
+
         def fit_regularized_output = FitRegularizedRNAKineticsModel(
-            fit_output.cache_for_regularization
-                .combine(prior_variance_out.regularization_coefficients)
+            use_plug_in_coverage
+                ? regularized_input.combine(plug_in_coverage_fits)
+                : regularized_input.map { chunk_input -> chunk_input + [[]] }
         )
 
         def merge_regularization_output = MergeRegularization(
@@ -486,11 +538,16 @@ workflow intron_specific_rna_kinetics_model_subworkflow {
         library_size_factors
         isoform_length_factors
         coverage_files
+        plug_in_coverage_fits
+        use_plug_in_coverage
 
     main:
-        def model_subfolder = 'intron_specific_rna_kinetics_model'
+        // The joint likelihood writes to its own folder, so which estimator produced
+        // a set of results is visible from the results themselves.
+        def model_subfolder = use_plug_in_coverage ? 'intron_specific_rna_kinetics_model'
+            : 'intron_specific_rna_kinetics_model_joint_likelihood'
 
-        def model_input = gene_names_chunks
+        def model_input_without_coverage_fits = gene_names_chunks
             .flatten()
             .map{ file -> tuple(file, file.baseName)}
             .combine(modeled_introns)
@@ -503,7 +560,13 @@ workflow intron_specific_rna_kinetics_model_subworkflow {
             .combine(isoform_length_factors)
             // Wrapping coverage_files in an extra list prevents unwanted flattening behavior in .combine()
             .combine(coverage_files.map { file_list -> tuple([file_list]) })
-            .map { it + [true] }
+            .map { chunk_input -> chunk_input + [true] }
+
+        // The plug-in route attaches the merged coverage fits. The joint one attaches an empty
+        // list, which stages no file and so leaves the argument off the command line.
+        def model_input = use_plug_in_coverage
+            ? model_input_without_coverage_fits.combine(plug_in_coverage_fits)
+            : model_input_without_coverage_fits.map { chunk_input -> chunk_input + [[]] }
 
         def fit_output = FitRNAKineticsModel(model_input)
 
@@ -516,9 +579,13 @@ workflow intron_specific_rna_kinetics_model_subworkflow {
 
         def prior_variance_out = EstimatePriorVariance(model_result_merged.ratio_lfcs, model_subfolder)
 
+        def regularized_input = fit_output.cache_for_regularization
+            .combine(prior_variance_out.regularization_coefficients)
+
         def fit_regularized_output = FitRegularizedRNAKineticsModel(
-            fit_output.cache_for_regularization
-                .combine(prior_variance_out.regularization_coefficients)
+            use_plug_in_coverage
+                ? regularized_input.combine(plug_in_coverage_fits)
+                : regularized_input.map { chunk_input -> chunk_input + [[]] }
         )
 
         def merge_regularization_output = MergeRegularization(
@@ -585,7 +652,14 @@ workflow gene_specific_intron_coverage_model_subworkflow {
             model_subfolder
         )
 
+        def plug_in_output = MergePlugInCoverageFits(
+            fit_output.plug_in_coverage_fits_chunk.collect())
+
         PostprocessResultsAndPlot(merge_regularization_output.raw_test_results, 'intron_coverage', model_subfolder)
+
+    emit:
+        plug_in_coverage_fits = plug_in_output.plug_in_coverage_fits
+        raw_test_results = merge_regularization_output.raw_test_results
 }
 
 
@@ -634,7 +708,14 @@ workflow intron_specific_intron_coverage_model_subworkflow {
             model_subfolder
         )
 
+        def plug_in_output = MergePlugInCoverageFits(
+            fit_output.plug_in_coverage_fits_chunk.collect())
+
         PostprocessResultsAndPlot(merge_regularization_output.raw_test_results, 'intron_coverage', model_subfolder)
+
+    emit:
+        plug_in_coverage_fits = plug_in_output.plug_in_coverage_fits
+        raw_test_results = merge_regularization_output.raw_test_results
 }
 
 
@@ -661,6 +742,11 @@ workflow global_intron_coverage_model_subworkflow {
         )
 
         PostprocessGlobalResultsAndPlot(fit_output.test_results, 'global_intron_coverage', model_subfolder)
+
+    emit:
+        // One fit over the whole dataset, so there are no chunks to merge.
+        plug_in_coverage_fits = fit_output.plug_in_coverage_fits
+        raw_test_results = fit_output.test_results
 }
 
 
@@ -676,22 +762,34 @@ workflow global_rna_kinetics_model_subworkflow {
         library_size_factors
         isoform_length_factors
         coverage_files
+        plug_in_coverage_fits
+        use_plug_in_coverage
 
     main:
-        def model_subfolder = 'global_rna_kinetics_model'
+        // The joint likelihood writes to its own folder, so which estimator produced
+        // a set of results is visible from the results themselves.
+        def model_subfolder = use_plug_in_coverage ? 'global_rna_kinetics_model'
+            : 'global_rna_kinetics_model_joint_likelihood'
 
+        def fit_input_without_coverage_fits = modeled_genes
+            .combine(modeled_introns)
+            .combine(design_matrix)
+            .combine(lrt_metadata)
+            .combine(reduced_design_matrices)
+            .combine(exon_counts)
+            .combine(intron_counts)
+            .combine(library_size_factors)
+            .combine(isoform_length_factors)
+            // Wrapping coverage_files in an extra list prevents unwanted flattening behavior in .combine()
+            .combine(coverage_files.map { file_list -> tuple([file_list]) })
+
+        // The plug-in route attaches the single genome-wide coverage fit. The joint one attaches
+        // an empty list, which stages no file and so leaves the argument off the command line.
         def fit_output = FitGlobalRNAKineticsModel(
-            modeled_genes
-                .combine(modeled_introns)
-                .combine(design_matrix)
-                .combine(lrt_metadata)
-                .combine(reduced_design_matrices)
-                .combine(exon_counts)
-                .combine(intron_counts)
-                .combine(library_size_factors)
-                .combine(isoform_length_factors)
-                // Wrapping coverage_files in an extra list prevents unwanted flattening behavior in .combine()
-                .combine(coverage_files.map { file_list -> tuple([file_list]) })
+            (use_plug_in_coverage
+                ? fit_input_without_coverage_fits.combine(plug_in_coverage_fits)
+                : fit_input_without_coverage_fits.map { fit_input -> fit_input + [[]] })
+                .map { fit_input -> fit_input + [model_subfolder] }
         )
 
         PostprocessGlobalResultsAndPlot(fit_output.test_results, 'global_rna_kinetics', model_subfolder)
@@ -720,6 +818,13 @@ process StratifiedIntronMetacoveragePlots {
 }
 
 
+def warn_coverage_switched_on(String coverage_flag) {
+    log.warn "Switching on ${coverage_flag}: the RNA kinetics model it serves plugs in its fit " +
+        "of lfc_elong_over_splice. Set use_plug_in_coverage to false to fit the joint likelihood " +
+        "instead, which we do not recommend."
+}
+
+
 workflow modeling_workflow {
     take:
         samplesheet_input
@@ -734,12 +839,13 @@ workflow modeling_workflow {
         contrasts
         modelable_genes_input
         modelable_introns_input
-        fit_rna_kinetics_model
+        fit_gene_specific_rna_kinetics_model
         fit_intron_specific_rna_kinetics_model
         fit_global_rna_kinetics_model
         fit_global_intron_coverage_model
         fit_gene_specific_intron_coverage_model
         fit_intron_specific_intron_coverage_model
+        use_plug_in_coverage
 
     main:
         def samplesheet = Channel.value(file(samplesheet_input))
@@ -766,8 +872,33 @@ workflow modeling_workflow {
                 .combine(modelable_introns_input)
         )
 
-        if (fit_rna_kinetics_model) {
-            gene_specific_rna_kinetics_model_subworkflow(
+        // Each plug-in kinetics model is a stage two, so the coverage model it reads has to run.
+        // Switching that on is the only way to honour the request, a plug-in having nothing to
+        // plug in otherwise, so the flag is overridden rather than the run refused.
+        def run_gene_specific_coverage = fit_gene_specific_intron_coverage_model
+        if (use_plug_in_coverage && fit_gene_specific_rna_kinetics_model
+                && !fit_gene_specific_intron_coverage_model) {
+            warn_coverage_switched_on('fit_gene_specific_intron_coverage_model')
+            run_gene_specific_coverage = true
+        }
+        def run_intron_specific_coverage = fit_intron_specific_intron_coverage_model
+        if (use_plug_in_coverage && fit_intron_specific_rna_kinetics_model
+                && !fit_intron_specific_intron_coverage_model) {
+            warn_coverage_switched_on('fit_intron_specific_intron_coverage_model')
+            run_intron_specific_coverage = true
+        }
+        def run_global_coverage = fit_global_intron_coverage_model
+        if (use_plug_in_coverage && fit_global_rna_kinetics_model
+                && !fit_global_intron_coverage_model) {
+            warn_coverage_switched_on('fit_global_intron_coverage_model')
+            run_global_coverage = true
+        }
+
+        // Stage one first, so that the kinetics models can read what it produced. A kinetics
+        // model fitting the joint likelihood is handed an empty channel it never consumes.
+        def gene_specific_coverage_output = null
+        if (run_gene_specific_coverage) {
+            gene_specific_coverage_output = gene_specific_intron_coverage_model_subworkflow(
                 modeled_genes.gene_names_chunks,
                 modeled_genes.modeled_introns,
                 design_matrices_data.design_matrix,
@@ -778,6 +909,48 @@ workflow modeling_workflow {
                 library_size_factors_input,
                 isoform_length_factors_input,
                 coverage_files_input
+            )
+        }
+
+        def intron_specific_coverage_output = null
+        if (run_intron_specific_coverage) {
+            intron_specific_coverage_output = intron_specific_intron_coverage_model_subworkflow(
+                modeled_genes.intron_chunks,
+                design_matrices_data.design_matrix,
+                design_matrices_data.lrt_metadata,
+                design_matrices_data.reduced_design_matrices,
+                library_size_factors_input,
+                coverage_files_input
+            )
+        }
+
+        def global_coverage_output = null
+        if (run_global_coverage) {
+            global_coverage_output = global_intron_coverage_model_subworkflow(
+                modeled_genes.modeled_introns,
+                design_matrices_data.design_matrix,
+                design_matrices_data.lrt_metadata,
+                design_matrices_data.reduced_design_matrices,
+                library_size_factors_input,
+                coverage_files_input
+            )
+        }
+
+        if (fit_gene_specific_rna_kinetics_model) {
+            gene_specific_rna_kinetics_model_subworkflow(
+                modeled_genes.gene_names_chunks,
+                modeled_genes.modeled_introns,
+                design_matrices_data.design_matrix,
+                design_matrices_data.lrt_metadata,
+                design_matrices_data.reduced_design_matrices,
+                exon_counts_input,
+                intron_counts_input,
+                library_size_factors_input,
+                isoform_length_factors_input,
+                coverage_files_input,
+                use_plug_in_coverage ? gene_specific_coverage_output.plug_in_coverage_fits
+                    : channel.empty(),
+                use_plug_in_coverage
             )
         }
 
@@ -792,7 +965,10 @@ workflow modeling_workflow {
                 intron_counts_input,
                 library_size_factors_input,
                 isoform_length_factors_input,
-                coverage_files_input
+                coverage_files_input,
+                use_plug_in_coverage ? intron_specific_coverage_output.plug_in_coverage_fits
+                    : channel.empty(),
+                use_plug_in_coverage
             )
         }
 
@@ -807,45 +983,10 @@ workflow modeling_workflow {
                 intron_counts_input,
                 library_size_factors_input,
                 isoform_length_factors_input,
-                coverage_files_input
+                coverage_files_input,
+                use_plug_in_coverage ? global_coverage_output.plug_in_coverage_fits
+                    : channel.empty(),
+                use_plug_in_coverage
             )
         }
-
-        if (fit_gene_specific_intron_coverage_model) {
-            gene_specific_intron_coverage_model_subworkflow(
-                modeled_genes.gene_names_chunks,
-                modeled_genes.modeled_introns,
-                design_matrices_data.design_matrix,
-                design_matrices_data.lrt_metadata,
-                design_matrices_data.reduced_design_matrices,
-                exon_counts_input,
-                intron_counts_input,
-                library_size_factors_input,
-                isoform_length_factors_input,
-                coverage_files_input
-            )
-        }
-
-        if (fit_intron_specific_intron_coverage_model) {
-            intron_specific_intron_coverage_model_subworkflow(
-                modeled_genes.intron_chunks,
-                design_matrices_data.design_matrix,
-                design_matrices_data.lrt_metadata,
-                design_matrices_data.reduced_design_matrices,
-                library_size_factors_input,
-                coverage_files_input
-            )
-        }
-
-        if (fit_global_intron_coverage_model) {
-            global_intron_coverage_model_subworkflow(
-                modeled_genes.modeled_introns,
-                design_matrices_data.design_matrix,
-                design_matrices_data.lrt_metadata,
-                design_matrices_data.reduced_design_matrices,
-                library_size_factors_input,
-                coverage_files_input
-            )
-        }
-
 }

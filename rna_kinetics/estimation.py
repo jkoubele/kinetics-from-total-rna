@@ -1248,6 +1248,43 @@ def concat_plug_in_coverage_fits(fits: list[PlugInCoverageFit],
                               is_regularized=is_regularized)
 
 
+def merge_plug_in_coverage_fits(artifacts: list[PlugInCoverageFits]) -> PlugInCoverageFits:
+    """
+    One chunk's coverage fits per artifact, into the single artifact a plug-in stage two reads.
+
+    Every chunk has to describe the same design and the same stage, a consumer reading one
+    `feature_names` and one `is_regularized` for all of them.
+
+    No intron may appear twice. Chunks cover disjoint introns by construction, so a repeat is a
+    wiring fault rather than something the data can produce, and it would be a quiet one:
+    `PlugInCoverage.from_fits` keeps whichever fit it indexed last, and the Fisher information it
+    lays out is block diagonal by fit only because the fits are over disjoint introns.
+    """
+    if not artifacts:
+        raise ValueError('No coverage fit artifacts to merge.')
+    feature_names = artifacts[0].feature_names
+    is_regularized = artifacts[0].is_regularized
+    for artifact in artifacts[1:]:
+        if artifact.feature_names != feature_names:
+            raise ValueError(f'Coverage fit chunks describe different designs: {feature_names} '
+                             f'and {artifact.feature_names}.')
+        if artifact.is_regularized != is_regularized:
+            raise ValueError('Coverage fit chunks mix the regularized refit with the fit it '
+                             'started from.')
+
+    fits = [fit for artifact in artifacts for fit in artifact.fits]
+    covered: set[str] = set()
+    repeated: set[str] = set()
+    for fit in fits:
+        for intron_name in fit.intron_names:
+            if intron_name in covered:
+                repeated.add(intron_name)
+            covered.add(intron_name)
+    if repeated:
+        raise ValueError(f'Coverage fit chunks cover introns {sorted(repeated)} more than once.')
+    return concat_plug_in_coverage_fits(fits, feature_names, is_regularized=is_regularized)
+
+
 def add_wald_test_results(df_param: pd.DataFrame,
                           parameter_covariance: Optional[ParameterCovariance],
                           fisher_information_matrix: torch.Tensor) -> pd.DataFrame:
