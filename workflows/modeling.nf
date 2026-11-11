@@ -4,14 +4,19 @@ process WriteDesignMetadata {
     input:
     val design_formula
     val contrasts
+    val use_plug_in_coverage
 
     output:
     path "design.json"
     path "contrasts.json", emit: contrasts_json
 
     script:
+    // `use_plug_in_coverage` is recorded as it was requested. A kinetics model that ran under it
+    // reports `intron_coverage` in its own `source_model` column, so the two together say which
+    // estimator produced any given row.
     def design_obj = [
-        design_formula : design_formula,
+        design_formula       : design_formula,
+        use_plug_in_coverage : use_plug_in_coverage,
     ]
 
     def design_json_str       = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(design_obj))
@@ -904,7 +909,9 @@ workflow modeling_workflow {
 
         StratifiedIntronMetacoveragePlots(stratified_plot_input, design_formula)
 
-        def design_metadata = WriteDesignMetadata(design_formula, contrasts)
+        def design_metadata = WriteDesignMetadata(design_formula,
+                                                 contrasts,
+                                                 use_plug_in_coverage)
 
         def design_matrices_data = CreateDesignMatrices(
             samplesheet,

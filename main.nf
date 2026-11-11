@@ -2,6 +2,15 @@ include { preprocessing_workflow } from './workflows/preprocessing.nf'
 include { modeling_workflow } from './workflows/modeling.nf'
 
 
+// A boolean parameter set on the command line as `--flag false` arrives as the string "false",
+// which is truthy in Groovy, so the flag would stay on. Set in a params file or in
+// `nextflow.config` it is already a boolean and passes through unchanged, and one left unset
+// stays off.
+def as_boolean(value) {
+    return value ? value.toString().toBoolean() : false
+}
+
+
 workflow {
 
     def preproc_out
@@ -99,13 +108,13 @@ workflow {
             contrasts,
             modelable_genes,
             modelable_introns,
-            params.fit_gene_specific_rna_kinetics_model,
-            params.fit_intron_specific_rna_kinetics_model,
-            params.fit_global_rna_kinetics_model,
-            params.fit_global_intron_coverage_model,
-            params.fit_gene_specific_intron_coverage_model,
-            params.fit_intron_specific_intron_coverage_model,
-            params.use_plug_in_coverage
+            as_boolean(params.fit_gene_specific_rna_kinetics_model),
+            as_boolean(params.fit_intron_specific_rna_kinetics_model),
+            as_boolean(params.fit_global_rna_kinetics_model),
+            as_boolean(params.fit_global_intron_coverage_model),
+            as_boolean(params.fit_gene_specific_intron_coverage_model),
+            as_boolean(params.fit_intron_specific_intron_coverage_model),
+            as_boolean(params.use_plug_in_coverage)
         )
     }
 }
