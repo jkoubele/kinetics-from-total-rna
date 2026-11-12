@@ -1148,7 +1148,20 @@ def get_two_stage_parameter_covariance(
     hessian_matrix = hessian_matrix.cpu().double()
     information_free = hessian_matrix[covariance_free.rows][:, covariance_free.rows]
     mixed = hessian_matrix[covariance_free.rows][:, num_free_parameters:]
-    plug_in_block = (mixed.T @ covariance_free.matrix.double() @ mixed
+
+    # `V2` is inverted again here in double, rather than taken from `covariance_free`, which
+    # holds the inverse of the single-precision Hessian. `J`'s inverse reproduces the three
+    # blocks above only because `I_22 M = I_21` holds exactly, and `J` is built to be exactly
+    # singular wherever stage one is, so that cancellation is the whole of what its conditioning
+    # rests on. A `V2` carrying single-precision error leaves the corner inconsistent with the
+    # block beside it by about its own `eps`, and the near-singular inverse amplifies that by
+    # orders of magnitude: the corrected variances come back wrong, negative ones among them,
+    # while the matrix stays finite and definite-looking. Promoting `covariance_free.matrix`
+    # cannot recover it, a promoted matrix being no more accurate than the one it came from.
+    covariance_free_double = try_invert(information_free)
+    if covariance_free_double is None:
+        return None
+    plug_in_block = (mixed.T @ covariance_free_double @ mixed
                      + plug_in_information.cpu().double())
     joint_information = torch.cat([
         torch.cat([information_free, mixed], dim=1),
