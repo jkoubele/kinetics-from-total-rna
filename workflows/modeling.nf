@@ -321,7 +321,29 @@ process MergePlugInCoverageFits {
     export PYTHONPATH='${baseDir}'\${PYTHONPATH:+:\$PYTHONPATH}
     merge_plug_in_coverage_fits.py \
     --input_folder . \
+    --chunk_prefix plug_in_coverage_fits \
     --output_file plug_in_coverage_fits.pt
+    """
+}
+
+
+process MergeRegularizedPlugInCoverageFits {
+    // The same merge over the penalized refit's chunks. A separate process rather than the one
+    // above taking which stage to collect, because a process may be invoked once per workflow
+    // scope and a coverage subworkflow merges both.
+    input:
+    path regularized_plug_in_coverage_fits_chunks
+
+    output:
+    path("regularized_plug_in_coverage_fits.pt"), emit: plug_in_coverage_fits
+
+    script:
+    """
+    export PYTHONPATH='${baseDir}'\${PYTHONPATH:+:\$PYTHONPATH}
+    merge_plug_in_coverage_fits.py \
+    --input_folder . \
+    --chunk_prefix regularized_plug_in_coverage_fits \
+    --output_file regularized_plug_in_coverage_fits.pt
     """
 }
 
@@ -383,6 +405,9 @@ process FitRegularizedIntronCoverageModel {
     output:
     path("regularized_model_parameters*.tsv"), emit: regularized_model_parameters_chunk
     path("regularized_ratio_lfcs*.tsv"), emit: regularized_ratio_lfcs_chunk
+    // The values an RNA kinetics refit freezes. Its own fit carries no Fisher information, the
+    // Hessian of a penalized objective not being one, which is what `is_regularized` records.
+    path("regularized_plug_in_coverage_fits*.pt"), emit: regularized_plug_in_coverage_fits_chunk
 
     script:
     """
@@ -493,6 +518,7 @@ workflow gene_specific_rna_kinetics_model_subworkflow {
         isoform_length_factors
         coverage_files
         plug_in_coverage_fits
+        regularized_plug_in_coverage_fits
         coverage_test_results
         use_plug_in_coverage
 
@@ -537,9 +563,12 @@ workflow gene_specific_rna_kinetics_model_subworkflow {
         def regularized_input = fit_output.cache_for_regularization
             .combine(prior_variance_out.regularization_coefficients)
 
+        // The penalized refit freezes the coverage model's penalized refit, where the fit above
+        // froze its MLEs, so that the ratios built from the frozen value are regularized in
+        // every part rather than in only the ones this model estimates.
         def fit_regularized_output = FitRegularizedRNAKineticsModel(
             use_plug_in_coverage
-                ? regularized_input.combine(plug_in_coverage_fits)
+                ? regularized_input.combine(regularized_plug_in_coverage_fits)
                 : regularized_input.map { chunk_input -> chunk_input + [[]] }
         )
 
@@ -575,6 +604,7 @@ workflow intron_specific_rna_kinetics_model_subworkflow {
         isoform_length_factors
         coverage_files
         plug_in_coverage_fits
+        regularized_plug_in_coverage_fits
         coverage_test_results
         use_plug_in_coverage
 
@@ -619,9 +649,12 @@ workflow intron_specific_rna_kinetics_model_subworkflow {
         def regularized_input = fit_output.cache_for_regularization
             .combine(prior_variance_out.regularization_coefficients)
 
+        // The penalized refit freezes the coverage model's penalized refit, where the fit above
+        // froze its MLEs, so that the ratios built from the frozen value are regularized in
+        // every part rather than in only the ones this model estimates.
         def fit_regularized_output = FitRegularizedRNAKineticsModel(
             use_plug_in_coverage
-                ? regularized_input.combine(plug_in_coverage_fits)
+                ? regularized_input.combine(regularized_plug_in_coverage_fits)
                 : regularized_input.map { chunk_input -> chunk_input + [[]] }
         )
 
@@ -700,10 +733,18 @@ workflow gene_specific_intron_coverage_model_subworkflow {
         def plug_in_output = MergePlugInCoverageFits(
             fit_output.plug_in_coverage_fits_chunk.collect())
 
+        def regularized_plug_in_output = MergeRegularizedPlugInCoverageFits(
+            fit_regularized_output.regularized_plug_in_coverage_fits_chunk.collect())
+
         PostprocessResultsAndPlot(merge_regularization_output.raw_test_results, 'intron_coverage', model_subfolder)
 
     emit:
+        // Two stages of the same fit. An RNA kinetics model freezes the first in its own
+        // unregularized fit, where the standard errors come from and where a Fisher information
+        // is needed, and the second in its penalized refit, so that every ratio it reports as
+        // regularized is built from parts that were all shrunk.
         plug_in_coverage_fits = plug_in_output.plug_in_coverage_fits
+        regularized_plug_in_coverage_fits = regularized_plug_in_output.plug_in_coverage_fits
         raw_test_results = merge_regularization_output.raw_test_results
 }
 
@@ -756,10 +797,18 @@ workflow intron_specific_intron_coverage_model_subworkflow {
         def plug_in_output = MergePlugInCoverageFits(
             fit_output.plug_in_coverage_fits_chunk.collect())
 
+        def regularized_plug_in_output = MergeRegularizedPlugInCoverageFits(
+            fit_regularized_output.regularized_plug_in_coverage_fits_chunk.collect())
+
         PostprocessResultsAndPlot(merge_regularization_output.raw_test_results, 'intron_coverage', model_subfolder)
 
     emit:
+        // Two stages of the same fit. An RNA kinetics model freezes the first in its own
+        // unregularized fit, where the standard errors come from and where a Fisher information
+        // is needed, and the second in its penalized refit, so that every ratio it reports as
+        // regularized is built from parts that were all shrunk.
         plug_in_coverage_fits = plug_in_output.plug_in_coverage_fits
+        regularized_plug_in_coverage_fits = regularized_plug_in_output.plug_in_coverage_fits
         raw_test_results = merge_regularization_output.raw_test_results
 }
 
@@ -791,6 +840,11 @@ workflow global_intron_coverage_model_subworkflow {
     emit:
         // One fit over the whole dataset, so there are no chunks to merge.
         plug_in_coverage_fits = fit_output.plug_in_coverage_fits
+        // One LFC over the whole dataset has no between-unit distribution to shrink toward, so
+        // this variant runs no penalized refit and there is no second stage to hand over. A
+        // kinetics refit plugging this in therefore freezes the same values its own first fit
+        // did, which is the one case where the two stages coincide.
+        regularized_plug_in_coverage_fits = fit_output.plug_in_coverage_fits
         raw_test_results = fit_output.test_results
 }
 
@@ -1003,6 +1057,9 @@ workflow modeling_workflow {
                 coverage_files_input,
                 use_plug_in_coverage ? gene_specific_coverage_output.plug_in_coverage_fits
                     : channel.empty(),
+                use_plug_in_coverage
+                    ? gene_specific_coverage_output.regularized_plug_in_coverage_fits
+                    : channel.empty(),
                 use_plug_in_coverage ? gene_specific_coverage_output.raw_test_results : channel.empty(),
                 use_plug_in_coverage
             )
@@ -1021,6 +1078,9 @@ workflow modeling_workflow {
                 isoform_length_factors_input,
                 coverage_files_input,
                 use_plug_in_coverage ? intron_specific_coverage_output.plug_in_coverage_fits
+                    : channel.empty(),
+                use_plug_in_coverage
+                    ? intron_specific_coverage_output.regularized_plug_in_coverage_fits
                     : channel.empty(),
                 use_plug_in_coverage ? intron_specific_coverage_output.raw_test_results : channel.empty(),
                 use_plug_in_coverage

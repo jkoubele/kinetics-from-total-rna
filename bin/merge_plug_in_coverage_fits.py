@@ -14,7 +14,13 @@ if __name__ == "__main__":
     parser.add_argument('--input_folder',
                         type=Path,
                         default=Path('.'),
-                        help='Folder holding the per-chunk plug_in_coverage_fits_*.pt files.')
+                        help='Folder holding the per-chunk <prefix>_*.pt files.')
+    parser.add_argument('--chunk_prefix',
+                        type=str,
+                        default='plug_in_coverage_fits',
+                        help='Filename stem the chunks were written under. The fit and its '
+                             'penalized refit each write their own, and they are merged '
+                             'separately rather than together: a consumer reads one stage.')
     parser.add_argument('--output_file',
                         type=Path,
                         default=Path('plug_in_coverage_fits.pt'),
@@ -24,10 +30,10 @@ if __name__ == "__main__":
     # Sorted so that the merged artifact holds the chunks in a reproducible order. Which order
     # does not matter to a consumer, `PlugInCoverage.from_fits` addressing the fits by intron
     # name, but an arbitrary one would make two runs of the same input differ byte for byte.
-    chunk_files = sorted(args.input_folder.glob('plug_in_coverage_fits_*.pt'))
+    chunk_files = sorted(args.input_folder.glob(f'{args.chunk_prefix}_*.pt'))
     if not chunk_files:
         raise FileNotFoundError(
-            f'No plug_in_coverage_fits_*.pt found in {args.input_folder.resolve()}.')
+            f'No {args.chunk_prefix}_*.pt found in {args.input_folder.resolve()}.')
 
     merged = merge_plug_in_coverage_fits(
         [torch.load(chunk_file, weights_only=False) for chunk_file in chunk_files])

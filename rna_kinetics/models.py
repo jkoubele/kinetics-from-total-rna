@@ -555,6 +555,25 @@ class RNAKineticsModel(nn.Module):
             if tests_single_intron:
                 self.tested_intron_index = self.intron_names.index(lrt_specification.tested_intron)
 
+    def set_plug_in_coverage(self, plug_in_coverage: PlugInCoverage) -> None:
+        """
+        Put a coverage fit's values into the buffers, replacing whatever is in them.
+
+        `load_state_dict` restores buffers alongside parameters, and a plug-in model's state dict
+        names `lfc_elong_over_splice` and `intercept_pi_logit` exactly as a model estimating them
+        does. So a hot start taken from a fit that froze different values overwrites these two
+        without an error to say so. A refit that freezes a different coverage fit from the one it
+        is warm-started from has to call this after loading the hot start.
+        """
+        if not self.coverage_is_plugged_in:
+            raise ValueError('Nothing is plugged in to set: this model estimates '
+                             'lfc_elong_over_splice and intercept_pi_logit itself.')
+        plug_in_coverage.check_shapes(tuple(self.lfc_elong_over_splice.shape),
+                                      len(self.intron_names))
+        with torch.no_grad():
+            self.lfc_elong_over_splice.copy_(plug_in_coverage.lfc_elong_over_splice)
+            self.intercept_pi_logit.copy_(plug_in_coverage.intercept_pi_logit)
+
     def initialize_parameters(self,
                               gene_data: GeneData,
                               library_sizes: torch.Tensor,

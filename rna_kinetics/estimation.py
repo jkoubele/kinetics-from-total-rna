@@ -9,7 +9,7 @@ from scipy import stats
 from torch import nn, optim
 from torch.func import functional_call, hessian
 
-from rna_kinetics.data import GeneData, IntronData, DatasetMetadata, GlobalGeneData
+from rna_kinetics.data import MODEL_DTYPE, GeneData, IntronData, DatasetMetadata, GlobalGeneData
 from rna_kinetics.models import RNAKineticsLoss, RNAKineticsModel, TestedRatio, LRTSpecification, \
     IntronCoverageModel, CoverageLoss, GlobalRNAKineticsModel, RATIO_AS_LFC_COMBINATION, \
     GLOBAL_MODEL_TESTED_RATIOS, GLOBAL_PLUG_IN_TESTABLE_RATIOS, PLUG_IN_TESTABLE_RATIOS, \
@@ -606,7 +606,7 @@ def get_prior_precision(regularization_coefficients_df: pd.DataFrame,
             lambdas = np.array([row['lambda'] for row in rows], dtype=np.float64)
             precision[feature_index][estimated_indices, estimated_indices] = np.where(
                 np.isfinite(lambdas), 2 * lambdas, 0.0)
-    return torch.from_numpy(precision).float().to(device)
+    return torch.from_numpy(precision).to(dtype=MODEL_DTYPE, device=device)
 
 
 def get_prior_penalty(model: RNAKineticsModel, prior_precision: torch.Tensor) -> torch.Tensor:
@@ -1149,15 +1149,17 @@ def get_two_stage_parameter_covariance(
     information_free = hessian_matrix[covariance_free.rows][:, covariance_free.rows]
     mixed = hessian_matrix[covariance_free.rows][:, num_free_parameters:]
 
-    # `V2` is inverted again here in double, rather than taken from `covariance_free`, which
-    # holds the inverse of the single-precision Hessian. `J`'s inverse reproduces the three
-    # blocks above only because `I_22 M = I_21` holds exactly, and `J` is built to be exactly
-    # singular wherever stage one is, so that cancellation is the whole of what its conditioning
-    # rests on. A `V2` carrying single-precision error leaves the corner inconsistent with the
-    # block beside it by about its own `eps`, and the near-singular inverse amplifies that by
-    # orders of magnitude: the corrected variances come back wrong, negative ones among them,
-    # while the matrix stays finite and definite-looking. Promoting `covariance_free.matrix`
-    # cannot recover it, a promoted matrix being no more accurate than the one it came from.
+    # `V2` is inverted again here in double rather than taken from `covariance_free`, so that
+    # this block does not depend on the precision the fit ran in. `J`'s inverse reproduces the
+    # three blocks above only because `I_22 M = I_21` holds exactly, and `J` is built to be
+    # exactly singular wherever stage one is, so that cancellation is the whole of what its
+    # conditioning rests on. A `V2` carrying error from a narrower dtype leaves the corner
+    # inconsistent with the block beside it by about that dtype's `eps`, and the near-singular
+    # inverse amplifies it by orders of magnitude: the corrected variances come back wrong,
+    # negative ones among them, while the matrix stays finite and definite-looking. Promoting
+    # `covariance_free.matrix` cannot recover it, a promoted matrix being no more accurate than
+    # the one it came from. With `MODEL_DTYPE` at double the two agree and this inverse is
+    # redundant; it is kept because the invariant is about `J`, not about the fit's dtype.
     covariance_free_double = try_invert(information_free)
     if covariance_free_double is None:
         return None
@@ -1890,11 +1892,27 @@ def get_regularized_rna_kinetics_model_results(gene_data: GeneData,
     """
     Refit the per-gene model under the prior the first fit was used to estimate.
 
-    `plug_in_coverage_fits` has to be the same fits the unregularized model was given, so that the
-    refit is the same model and the hot start lands in it. Passing none where the first fit had
-    them would silently turn the plugged-in values back into free parameters: a state dict names
-    them identically either way, so `load_state_dict` accepts it and the refit then estimates
-    against the count arm what stage one read off the coverage shape.
+    `plug_in_coverage_fits` are the coverage model's **regularized** fits, where the unregularized
+    fit was handed its MLEs. Freezing the MLE here would leave `lfc_elong_over_deg` and
+    `lfc_init_over_elong` reported in the regularized column while one of the parts they are built
+    from had never been shrunk, and that part is the one the coverage shape determines least well:
+    where it is flat the MLE is at the edge of pi's range, so the frozen value is arbitrarily
+    large and the ratios containing it inherit that. Both values come from the refit as a pair,
+    since the intercepts re-optimize against the penalized LFC and the count arm reads the two of
+    them only through the nascent fraction they imply together.
+
+    The count arm's own `lfc_splice_over_deg` responds, because the intron counts pin down the
+    total while the plugged-in values set how it splits between the nascent and unspliced classes.
+    Its sensitivity is `d lfc_splice_over_deg / d lfc_elong_over_splice = -pi`, so a fraction pi
+    of whatever the shrinkage moved is absorbed there, and `lfc_elong_over_deg` carries the rest.
+    That is bounded by the nascent fraction rather than by how far the frozen value moved, which
+    is what keeps it small where the shrinkage is largest.
+
+    Passing none where the first fit had them would silently turn the plugged-in values back into
+    free parameters: a state dict names them identically either way, so `load_state_dict` accepts
+    it and the refit then estimates against the count arm what stage one read off the coverage
+    shape. For the same reason the hot start, taken from the fit that froze the MLEs, overwrites
+    these two buffers and `set_plug_in_coverage` has to put them back afterwards.
 
     The prior a plug-in is refitted under is the marginal one over the ratios still being
     estimated, which `get_prior_precision` builds from `get_frozen_basis_ratios` here; the reason
@@ -1913,6 +1931,8 @@ def get_regularized_rna_kinetics_model_results(gene_data: GeneData,
                                          intron_specific_lfc=intron_specific_lfc,
                                          plug_in_coverage=plug_in_coverage).to(device)
     model_regularized.load_state_dict(hot_start_state_dict)
+    if plug_in_coverage is not None:
+        model_regularized.set_plug_in_coverage(plug_in_coverage)
 
     prior_precision = get_prior_precision(regularization_coefficients_df,
                                           model_regularized.feature_names,
