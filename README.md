@@ -112,9 +112,9 @@ subfolder.
 
 The first aspect is which data are used by the model:
 
-* **RNA kinetics models** are fitted to the exon read counts, intron read counts and intron coverage
-  jointly. Since they also use the read counts, they can resolve all six rate ratios, apart from the
-  global variant, in which the ratios involving the initiation rate are not identifiable (see
+* **RNA kinetics models** are fitted to the exon read counts, intron read counts and intron
+  coverage. Since they also use the read counts, they can resolve all six rate ratios, apart from
+  the global variant, in which the ratios involving the initiation rate are not identifiable (see
   above).
 * **Intron coverage models** are fitted to the intron coverage only, and report only
   `lfc_elong_over_splice`. The coverage along an intron is informative about the ratio of the
@@ -139,8 +139,9 @@ An RNA kinetics model is fitted in two stages. The intron coverage model of the 
 is fitted first, which identifies the elongation over splicing effect from the shape of the intron
 coverage alone, and that estimate is then held fixed while the read counts are fitted. So enabling
 an RNA kinetics model also enables the intron coverage model it reads; if you left that one off,
-the pipeline switches it on and says so. The standard errors of the second stage account for the
-first stage having been estimated rather than known.
+the pipeline switches it on and says so. The standard errors of the second stage are corrected
+for the first stage having been estimated rather than known, by the two-step correction of
+Murphy and Topel (1985).
 
 You can instead fit both stages at once, by setting ```use_plug_in_coverage``` to false. We do not
 recommend it: one gene's intron coverage carries far less information about the elongation over
