@@ -9,7 +9,7 @@ from scipy import stats
 from torch import nn, optim
 from torch.func import functional_call, hessian
 
-from rna_kinetics.data import GeneData, IntronData, DatasetMetadata, GlobalGeneData
+from rna_kinetics.data import MODEL_DTYPE, GeneData, IntronData, DatasetMetadata, GlobalGeneData
 from rna_kinetics.models import RNAKineticsLoss, RNAKineticsModel, TestedRatio, LRTSpecification, \
     IntronCoverageModel, CoverageLoss, GlobalRNAKineticsModel, RATIO_AS_LFC_COMBINATION, \
     GLOBAL_MODEL_TESTED_RATIOS, GLOBAL_PLUG_IN_TESTABLE_RATIOS, PLUG_IN_TESTABLE_RATIOS, \
@@ -606,7 +606,7 @@ def get_prior_precision(regularization_coefficients_df: pd.DataFrame,
             lambdas = np.array([row['lambda'] for row in rows], dtype=np.float64)
             precision[feature_index][estimated_indices, estimated_indices] = np.where(
                 np.isfinite(lambdas), 2 * lambdas, 0.0)
-    return torch.from_numpy(precision).float().to(device)
+    return torch.from_numpy(precision).to(dtype=MODEL_DTYPE, device=device)
 
 
 def get_prior_penalty(model: RNAKineticsModel, prior_precision: torch.Tensor) -> torch.Tensor:
@@ -1149,15 +1149,17 @@ def get_two_stage_parameter_covariance(
     information_free = hessian_matrix[covariance_free.rows][:, covariance_free.rows]
     mixed = hessian_matrix[covariance_free.rows][:, num_free_parameters:]
 
-    # `V2` is inverted again here in double, rather than taken from `covariance_free`, which
-    # holds the inverse of the single-precision Hessian. `J`'s inverse reproduces the three
-    # blocks above only because `I_22 M = I_21` holds exactly, and `J` is built to be exactly
-    # singular wherever stage one is, so that cancellation is the whole of what its conditioning
-    # rests on. A `V2` carrying single-precision error leaves the corner inconsistent with the
-    # block beside it by about its own `eps`, and the near-singular inverse amplifies that by
-    # orders of magnitude: the corrected variances come back wrong, negative ones among them,
-    # while the matrix stays finite and definite-looking. Promoting `covariance_free.matrix`
-    # cannot recover it, a promoted matrix being no more accurate than the one it came from.
+    # `V2` is inverted again here in double rather than taken from `covariance_free`, so that
+    # this block does not depend on the precision the fit ran in. `J`'s inverse reproduces the
+    # three blocks above only because `I_22 M = I_21` holds exactly, and `J` is built to be
+    # exactly singular wherever stage one is, so that cancellation is the whole of what its
+    # conditioning rests on. A `V2` carrying error from a narrower dtype leaves the corner
+    # inconsistent with the block beside it by about that dtype's `eps`, and the near-singular
+    # inverse amplifies it by orders of magnitude: the corrected variances come back wrong,
+    # negative ones among them, while the matrix stays finite and definite-looking. Promoting
+    # `covariance_free.matrix` cannot recover it, a promoted matrix being no more accurate than
+    # the one it came from. With `MODEL_DTYPE` at double the two agree and this inverse is
+    # redundant; it is kept because the invariant is about `J`, not about the fit's dtype.
     covariance_free_double = try_invert(information_free)
     if covariance_free_double is None:
         return None

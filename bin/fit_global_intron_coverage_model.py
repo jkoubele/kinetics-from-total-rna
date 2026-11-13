@@ -8,7 +8,7 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from rna_kinetics.data import load_dataset_metadata
+from rna_kinetics.data import MODEL_DTYPE, load_dataset_metadata
 from rna_kinetics.estimation import (get_intron_coverage_model_results,
                                      concat_plug_in_coverage_fits)
 
@@ -65,7 +65,7 @@ if __name__ == "__main__":
 
     coverage = torch.tensor(
         np.stack([coverage_df_by_sample[sample].values for sample in dataset_metadata.sample_names]),
-        dtype=torch.float32,
+        dtype=MODEL_DTYPE,
     )
 
     # No ratio_lfcs here: the global model is not regularized, and with no Fisher information
