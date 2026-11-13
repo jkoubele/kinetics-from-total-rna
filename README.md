@@ -30,6 +30,11 @@ the [rna_kinetics](rna_kinetics) folder
 > underlying physical model of the RNA metabolism, and the inference model implemented in this
 > repository. We therefore recommend reading these sections if you want to understand what the
 > pipeline is fitting.
+>
+> The code is also slightly ahead of this draft. The two-stage estimator the pipeline now uses by
+> default, which fits the intron coverage shape first and holds the result fixed while fitting the
+> read counts, is not described there yet, and the regularization works somewhat differently from
+> what the draft says.
 
 ## What the model estimates
 
