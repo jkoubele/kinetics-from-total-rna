@@ -1980,10 +1980,10 @@ def get_intron_coverage_model_results(
     Fit IntronCoverageModel to the given introns and run its likelihood ratio tests.
 
     `is_global_model` says the single LFC is shared across the whole dataset's introns rather than
-    one gene's, which changes two things. Training goes through `_train_two_stage`, because there
-    are then tens of thousands of per-intron intercepts against that one LFC and optimising the
-    LFC alone first is far better conditioned. And no Wald test is computed, because the Fisher
-    information would be one row and column per intercept, making it very large.
+    one gene's, which changes two things. Training goes through `_train_global_model`, because
+    there are then tens of thousands of per-intron intercepts against that one LFC and optimising
+    the LFC alone first is far better conditioned. And no Wald test is computed, because the
+    Fisher information would be one row and column per intercept, making it very large.
 
     `intron_specific_lfc` says this call is one intron's fit, which is what decides whether the
     LFC is reported under that intron's name. It is declared rather than read off the length of
@@ -2005,7 +2005,7 @@ def get_intron_coverage_model_results(
             design_matrix: torch.Tensor,
             label: str) -> tuple[IntronCoverageModel, TrainingResults]:
         if is_global_model:
-            return _train_two_stage(
+            return _train_global_model(
                 model,
                 global_param_names={LFCParameter.ELONG_OVER_SPLICE},
                 make_closures=lambda opt: _make_intron_coverage_closures(
@@ -2164,45 +2164,54 @@ def _make_global_rna_kinetics_closures(
     return _make_closures(optimizer, _compute_loss)
 
 
-# The global models train in two stages and can need many more epochs than a per-gene fit, which
+# The global models train in two passes and can need many more epochs than a per-gene fit, which
 # `train_model` caps at its own, lower default.
-MAX_EPOCHS_TWO_STAGE = 1000
+MAX_EPOCHS_GLOBAL_MODEL = 1000
 
 
-def _train_two_stage(
+def _train_global_model(
         model: nn.Module,
         global_param_names: set[str],
         make_closures: Callable[[optim.Optimizer], tuple[Callable, Callable]],
         label: str = '',
         verbose: bool = False,
 ) -> tuple[nn.Module, TrainingResults]:
+    """
+    Fit a genome-wide model in two passes: the parameters in `global_param_names` alone, then all
+    of them from there.
+
+    A genome-wide variant has tens of thousands of per-unit intercepts standing against a handful
+    of shared LFCs. Optimising all of them from the start is badly conditioned and the fit can
+    diverge; holding the intercepts at their initial values and moving the shared parameters alone
+    is a small, well conditioned problem, and the second pass then starts near the optimum.
+    """
     prefix = f'[{label}] ' if label else ''
 
-    # Stage 1: freeze per-gene/per-intron params; optimize only shared params
+    # Pass 1: freeze per-gene/per-intron params; optimize only shared params
     if verbose:
-        print(f'{prefix}Stage 1: optimizing shared params ({", ".join(sorted(global_param_names))})', flush=True)
+        print(f'{prefix}Pass 1: optimizing shared params ({", ".join(sorted(global_param_names))})', flush=True)
     for name, param in model.named_parameters():
         param.requires_grad_(name in global_param_names)
-    stage_1_params = [p for p in model.parameters() if p.requires_grad and p.numel() > 0]
-    if stage_1_params:
-        optimizer_stage_1 = optim.LBFGS(
-            stage_1_params,
+    pass_1_params = [p for p in model.parameters() if p.requires_grad and p.numel() > 0]
+    if pass_1_params:
+        optimizer_pass_1 = optim.LBFGS(
+            pass_1_params,
             lr=1.0, max_iter=20, tolerance_change=1e-9, tolerance_grad=1e-7,
             history_size=100, line_search_fn='strong_wolfe',
         )
-        closure_stage_1, eval_stage_1 = make_closures(optimizer_stage_1)
-        model, _ = train_model(model, optimizer_stage_1, closure_stage_1, eval_stage_1,
-                               max_epochs=MAX_EPOCHS_TWO_STAGE, verbose=verbose)
+        closure_pass_1, eval_pass_1 = make_closures(optimizer_pass_1)
+        model, _ = train_model(model, optimizer_pass_1, closure_pass_1, eval_pass_1,
+                               max_epochs=MAX_EPOCHS_GLOBAL_MODEL, verbose=verbose)
 
-    # Stage 2: unfreeze all, refine jointly from warm start
+    # Pass 2: unfreeze all, refine every parameter from the warm start
     if verbose:
-        print(f'{prefix}Stage 2: joint optimization (all params)', flush=True)
+        print(f'{prefix}Pass 2: optimizing all params', flush=True)
     for param in model.parameters():
         param.requires_grad_(True)
-    optimizer_stage_2 = make_lbfgs_optimizer(model)
-    closure_stage_2, eval_stage_2 = make_closures(optimizer_stage_2)
-    model, training_results = train_model(model, optimizer_stage_2, closure_stage_2, eval_stage_2,
-                                          max_epochs=MAX_EPOCHS_TWO_STAGE,
+    optimizer_pass_2 = make_lbfgs_optimizer(model)
+    closure_pass_2, eval_pass_2 = make_closures(optimizer_pass_2)
+    model, training_results = train_model(model, optimizer_pass_2, closure_pass_2, eval_pass_2,
+                                          max_epochs=MAX_EPOCHS_GLOBAL_MODEL,
                                           verbose=verbose)
     return model, training_results
 
@@ -2264,7 +2273,7 @@ def get_global_rna_kinetics_model_results(
         global_param_names = {LFCParameter.ELONG_OVER_SPLICE, LFCParameter.SPLICE_OVER_DEG}
         if reduced_matrix is not None:
             global_param_names = global_param_names | {'reduced_lfc'}
-        return _train_two_stage(
+        return _train_global_model(
             model,
             global_param_names=global_param_names,
             make_closures=lambda opt: _make_global_rna_kinetics_closures(
