@@ -38,15 +38,6 @@ intron_summary <- intron_counts_df |>
   ) |>
   select(-all_of(sample_columns))
 
-modelable_introns <- intron_summary |>
-  filter(is_modelable)
-
-non_modelable_introns <- intron_summary |>
-  filter(!is_modelable)
-
-modelable_introns |> write_tsv(file.path(output_folder, 'modelable_introns.tsv'))
-non_modelable_introns |> write_tsv(file.path(output_folder, 'non_modelable_introns.tsv'))
-
 intron_gene_summary <- intron_summary |>
   group_by(gene_id) |>
   summarise(
@@ -102,4 +93,25 @@ modelable_genes |>
 
 non_modelable_genes |>
   write_tsv(file.path(output_folder, "non_modelable_genes.tsv"))
+
+# A modelable intron can belong to a non-modelable gene, since a gene also has to pass the exon
+# criterion. Carrying the gene's verdict on the intron row is what lets a per-intron fit tell which
+# of its introns a per-gene fit will go on to use. An intron whose gene is absent from the gene
+# table has no gene to be modelable, hence FALSE rather than NA.
+intron_summary <- intron_summary |>
+  left_join(
+    gene_summary |>
+      select(gene_id, gene_is_modelable = is_modelable),
+    by = "gene_id"
+  ) |>
+  mutate(gene_is_modelable = replace_na(gene_is_modelable, FALSE))
+
+modelable_introns <- intron_summary |>
+  filter(is_modelable)
+
+non_modelable_introns <- intron_summary |>
+  filter(!is_modelable)
+
+modelable_introns |> write_tsv(file.path(output_folder, 'modelable_introns.tsv'))
+non_modelable_introns |> write_tsv(file.path(output_folder, 'non_modelable_introns.tsv'))
 

@@ -39,8 +39,13 @@ if (!dir.exists(intron_chunks_output_subfolder)) {
 modeled_genes <- modelable_genes |>
   semi_join(input_gene_names, by = "gene_id")
 
+# Every intron of a modeled gene is here, plus introns of genes that were dropped by the gene
+# filter. gene_is_modeled separates the two, and replaces the gene_is_modelable column of the input
+# because the two differ by this run's gene selection.
 modeled_introns <- modelable_introns |>
-  semi_join(input_gene_names, by = "gene_id")
+  semi_join(input_gene_names, by = "gene_id") |>
+  select(-any_of("gene_is_modelable")) |>
+  mutate(gene_is_modeled = gene_id %in% modeled_genes$gene_id)
 
 modeled_genes |>
   write_tsv(file.path(output_folder, "modeled_genes.tsv"))

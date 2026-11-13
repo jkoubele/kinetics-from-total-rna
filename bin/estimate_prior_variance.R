@@ -62,29 +62,54 @@ if (!dir.exists(output_folder)) {
 }
 
 # The basis the penalty acts on when the input holds the per-gene model's ratios: the other three
-# are differences of these, so their priors follow from the same matrix instead of being fitted.
+# are linear combinations of these, so their priors follow from the same matrix instead of being
+# fitted. These are also the three the models parametrize, and the two a prior reads most directly
+# in: lfc_init_over_deg is differential expression of the mature RNA, and lfc_elong_over_splice is
+# how far the polymerase travels past the junction before the intron is cleaved.
+#
+# Those two share no rate, so no pairwise difference of this basis is itself one of the six ratios
+# and the sampling covariances cannot be rebuilt from variances alone. They are read from the
+# cov_with_* columns of ratio_lfcs instead, which Python writes off the same inverse Fisher
+# information the standard errors come from. See LFC_PRIOR_BASIS in rna_kinetics/estimation.py.
 #
 # An input that does not hold all three, such as the intron coverage model's single
-# lfc_elong_over_splice, has no such structure to exploit. The same name means different things in
-# the two models: a difference of two parameters in one, a parameter in its own right in the other.
-# Those inputs are therefore fitted one ratio at a time. Dispatching on what the input contains
-# rather than assuming is what keeps a coverage model from silently receiving no prior at all.
-BASIS <- c("lfc_init_over_deg", "lfc_elong_over_deg", "lfc_splice_over_deg")
-
-# Each remaining ratio as the pair of basis ratios it is the difference of. This is what turns the
-# derived ratios' reported standard errors into the sampling covariances between the basis
-# estimates, through cov(a, b) = (var(a) + var(b) - var(a - b)) / 2. All three variances are
-# marginals of one gene's inverse Fisher information, so the reconstruction is exact and the
-# resulting block is positive definite.
-DIFFERENCE_OF <- list(lfc_init_over_elong   = c("lfc_init_over_deg", "lfc_elong_over_deg"),
-                      lfc_init_over_splice  = c("lfc_init_over_deg", "lfc_splice_over_deg"),
-                      lfc_elong_over_splice = c("lfc_elong_over_deg", "lfc_splice_over_deg"))
+# lfc_elong_over_splice, has no such structure to exploit and is fitted one ratio at a time. That
+# is a statement about which ratios the input table covers, not about how either model is
+# parametrized: lfc_elong_over_splice is a parameter of both. Dispatching on what the input
+# contains rather than assuming is what keeps a coverage model from silently receiving no prior at
+# all.
+BASIS <- c("lfc_init_over_deg", "lfc_elong_over_splice", "lfc_splice_over_deg")
 
 # Every ratio as a contrast of the basis, which is what lets one fitted matrix yield all six
-# priors.
-CONTRAST <- c(lapply(set_names(seq_along(BASIS), BASIS), function(i) as.numeric(seq_along(BASIS) == i)),
-              lapply(DIFFERENCE_OF,
-                     function(pair) as.numeric(BASIS == pair[1]) - as.numeric(BASIS == pair[2])))
+# priors. Because the basis is the parametrization, these are the same coefficients as
+# RATIO_AS_LFC_COMBINATION in rna_kinetics/models.py, which is the single place the parametrization
+# is spelled out on the Python side; keep the two in step.
+CONTRAST <- list(lfc_init_over_deg     = c( 1,  0,  0),
+                 lfc_elong_over_splice = c( 0,  1,  0),
+                 lfc_splice_over_deg   = c( 0,  0,  1),
+                 lfc_elong_over_deg    = c( 0,  1,  1),
+                 lfc_init_over_splice  = c( 1,  0, -1),
+                 lfc_init_over_elong   = c( 1, -1, -1))
+
+# The ratio_lfcs columns carrying each row's covariance with each basis ratio, in BASIS order.
+COVARIANCE_WITH_BASIS <- paste0("cov_with_", BASIS)
+
+# The regularization_coefficients columns the fitted prior covariance is written to, in the same
+# order. Derived from BASIS so that moving the basis is one edit rather than four.
+PRIOR_COVARIANCE_COLUMNS <- paste0("prior_cov_", sub("^lfc_", "", BASIS))
+
+# The off-diagonal pairs of the basis, as index pairs into it, and the working column each one's
+# sampling covariance is carried in while a unit's block is assembled.
+BASIS_PAIRS <- combn(seq_along(BASIS), 2, simplify = FALSE)
+covariance_column <- function(pair) {
+  paste0("cov_of_", BASIS[pair[1]], "_with_", BASIS[pair[2]])
+}
+
+# The prior covariance columns as a one-row tibble, so their names follow BASIS rather than being
+# spelled out at each of the places a row is built.
+prior_covariance_tibble <- function(values = rep(NA_real_, length(BASIS))) {
+  as_tibble(set_names(as.list(values), PRIOR_COVARIANCE_COLUMNS))
+}
 
 # With no usable estimates there is nothing to learn a prior from, so fall back to a prior so wide
 # that it imposes no shrinkage. DESeq2 does the same, returning a prior variance of 1e6 when its
@@ -113,62 +138,60 @@ build_fit_table <- function(df_feature) {
   } else {
     distinct(df_feature, gene_name) |> mutate(intron_name = NA_character_)
   }
+  attach_columns <- function(units, one_ratio) {
+    is_shared <- all(is.na(one_ratio$intron_name))
+    left_join(units,
+              if (is_shared) select(one_ratio, -intron_name) else one_ratio,
+              by = if (is_shared) "gene_name" else c("gene_name", "intron_name"))
+  }
   for (ratio_name in names(CONTRAST)) {
-    one_ratio <- df_feature |>
+    units <- attach_columns(units, df_feature |>
       filter(rate_ratio == ratio_name) |>
       transmute(gene_name,
                 intron_name,
                 !!paste0("lfc_of_", ratio_name) := if_else(usable, lfc, NA_real_),
-                !!paste0("var_of_", ratio_name) := if_else(usable, lfc_se^2, NA_real_))
-    is_shared <- all(is.na(one_ratio$intron_name))
-    units <- left_join(units,
-                       if (is_shared) select(one_ratio, -intron_name) else one_ratio,
-                       by = if (is_shared) "gene_name" else c("gene_name", "intron_name"))
+                !!paste0("var_of_", ratio_name) := if_else(usable, lfc_se^2, NA_real_)))
+  }
+  # Each basis pair's sampling covariance, read off the first member's row. Python writes the
+  # cov_with_* columns from the same inverse Fisher information the standard errors come from, so
+  # a ratio's entry against itself is its own variance and only the off-diagonal pairs are needed
+  # here. No usability filter is applied: it depends on both members of the pair, and the second
+  # one's row is elsewhere in the input. An entry belonging to a member that was filtered out is
+  # never read, mixmeta removing that outcome's row and column from the block.
+  for (pair in BASIS_PAIRS) {
+    units <- attach_columns(units, df_feature |>
+      filter(rate_ratio == BASIS[pair[1]]) |>
+      transmute(gene_name,
+                intron_name,
+                !!covariance_column(pair) := .data[[COVARIANCE_WITH_BASIS[pair[2]]]]))
   }
   units
 }
 
 # The estimates and their sampling covariances, in the form mixmeta takes.
 #
-# A basis ratio is dropped for a unit when its own estimate is unusable, and also when a covariance
-# it needs is unavailable, which happens only where the bound excluded a difference while sparing
-# both its terms. Both members of such a pair are dropped, which needs no tie-break. mixmeta uses
-# whichever outcomes remain, so a partly dropped unit still contributes.
+# A basis ratio is dropped for a unit when its own estimate is unusable. mixmeta uses whichever
+# outcomes remain, so a partly dropped unit still contributes, and the entries of the block
+# belonging to a dropped outcome are never read.
 build_estimates_and_covariances <- function(fit_table) {
   num_units <- nrow(fit_table)
   estimates <- as.matrix(fit_table[, paste0("lfc_of_", BASIS)])
   colnames(estimates) <- BASIS
   variances <- as.matrix(fit_table[, paste0("var_of_", BASIS)])
-  covariances <- matrix(NA_real_, num_units, length(DIFFERENCE_OF))
-  num_pairs_dropped <- 0
+  covariances <- as.matrix(
+    fit_table[, vapply(BASIS_PAIRS, covariance_column, character(1))])
 
-  for (position in seq_along(DIFFERENCE_OF)) {
-    pair <- DIFFERENCE_OF[[position]]
-    first <- match(pair[1], BASIS)
-    second <- match(pair[2], BASIS)
-    difference_variance <- fit_table[[paste0("var_of_", names(DIFFERENCE_OF)[position])]]
-    covariances[, position] <- (variances[, first] + variances[, second] - difference_variance) / 2
-    unavailable <- is.na(covariances[, position]) &
-      !is.na(variances[, first]) & !is.na(variances[, second])
-    num_pairs_dropped <- num_pairs_dropped + sum(unavailable)
-    estimates[unavailable, c(first, second)] <- NA_real_
-    variances[unavailable, c(first, second)] <- NA_real_
-  }
-
-  # Entries belonging to a dropped outcome are never read, since mixmeta removes that outcome's row
-  # and column, so filling them with zero is only to keep each block well formed.
+  # Filling a dropped outcome's entries with zero is only to keep each block well formed.
   sampling_covariances <- lapply(seq_len(num_units), function(unit) {
     block <- diag(replace_na(variances[unit, ], 0), nrow = length(BASIS))
-    for (position in seq_along(DIFFERENCE_OF)) {
-      first <- match(DIFFERENCE_OF[[position]][1], BASIS)
-      second <- match(DIFFERENCE_OF[[position]][2], BASIS)
-      block[first, second] <- block[second, first] <- replace_na(covariances[unit, position], 0)
+    for (position in seq_along(BASIS_PAIRS)) {
+      pair <- BASIS_PAIRS[[position]]
+      block[pair[1], pair[2]] <- block[pair[2], pair[1]] <-
+        replace_na(covariances[unit, position], 0)
     }
     block
   })
-  list(estimates = estimates,
-       sampling_covariances = sampling_covariances,
-       num_pairs_dropped = num_pairs_dropped)
+  list(estimates = estimates, sampling_covariances = sampling_covariances)
 }
 
 # The fitted prior for one design column, as one row per rate ratio.
@@ -184,13 +207,13 @@ estimate_prior_for_feature <- function(df_feature) {
   estimates <- prepared$estimates
 
   # mixmeta factorises every unit's sampling covariance, so one unit whose block is not positive
-  # definite stops the fit for the whole design column. The reconstruction above is exact only
-  # while the inverse Fisher information behind it is a covariance matrix, which a fit that
-  # stopped away from a maximum of the likelihood does not give. Those units are dropped rather
-  # than repaired, because the values they carry are not valid estimates of a standard error. The
-  # test is the factorisation itself, since no bound on the entries detects it: the block can have
-  # every variance comfortably positive and every pairwise correlation below one and still not be
-  # a covariance matrix.
+  # definite stops the fit for the whole design column. The block is a principal submatrix of
+  # C %*% Sigma %*% t(C) and so inherits positive definiteness from the inverse Fisher information
+  # it came from, which a fit that stopped away from a maximum of the likelihood does not give.
+  # Those units are dropped rather than repaired, because the values they carry are not valid
+  # estimates of a standard error. The test is the factorisation itself, since no bound on the
+  # entries detects it: the block can have every variance comfortably positive and every pairwise
+  # correlation below one and still not be a covariance matrix.
   block_is_positive_definite <- function(unit) {
     present <- which(!is.na(estimates[unit, ]))
     if (length(present) == 0) {
@@ -208,7 +231,6 @@ estimate_prior_for_feature <- function(df_feature) {
   counts <- tibble(num_units_used = sum(rowSums(!is.na(estimates)) > 0),
                    num_units_total = nrow(fit_table),
                    num_estimates_used = sum(!is.na(estimates)),
-                   num_pairs_dropped = prepared$num_pairs_dropped,
                    num_units_not_positive_definite = sum(!keep))
   uninformative <- function(ratio_names, status) {
     tibble(feature_name = feature,
@@ -216,10 +238,8 @@ estimate_prior_for_feature <- function(df_feature) {
            prior_sd = sqrt(UNINFORMATIVE_PRIOR_VARIANCE),
            tau = NA_real_,
            mu = NA_real_,
-           prior_cov_init_over_deg = NA_real_,
-           prior_cov_elong_over_deg = NA_real_,
-           prior_cov_splice_over_deg = NA_real_,
            status = status) |>
+      bind_cols(prior_covariance_tibble()) |>
       bind_cols(counts)
   }
   if (!any(is_fittable)) {
@@ -261,14 +281,12 @@ estimate_prior_for_feature <- function(df_feature) {
            prior_sd = sqrt(as.numeric(t(fitted_contrast) %*% prior_covariance %*% fitted_contrast)),
            tau = sqrt(as.numeric(t(fitted_contrast) %*% between_gene_covariance %*% fitted_contrast)),
            mu = sum(fitted_contrast * pooled_mean),
-           prior_cov_init_over_deg = covariance_with_basis[[1]],
-           prior_cov_elong_over_deg = covariance_with_basis[[2]],
-           prior_cov_splice_over_deg = covariance_with_basis[[3]],
            # A prior of zero width in a direction asserts those effects are exactly zero, which
            # gives an infinite penalty and a non-finite loss in the refit. It is a failed fit, not
            # a finding.
            status = if (is_singular || !is.finite(prior_sd) || prior_sd <= 0)
              "degenerate_prior" else "ok") |>
+      bind_cols(prior_covariance_tibble(covariance_with_basis)) |>
       bind_cols(counts)
   })
   rows
@@ -284,17 +302,14 @@ estimate_priors_one_ratio_at_a_time <- function(df_feature) {
                   prior_sd = sqrt(UNINFORMATIVE_PRIOR_VARIANCE),
                   tau = NA_real_,
                   mu = NA_real_,
-                  prior_cov_init_over_deg = NA_real_,
-                  prior_cov_elong_over_deg = NA_real_,
-                  prior_cov_splice_over_deg = NA_real_,
                   status = "no_usable_estimates",
                   num_units_used = nrow(usable),
                   num_units_total = sum(df_feature$rate_ratio == ratio_name),
                   num_estimates_used = nrow(usable),
-                  num_pairs_dropped = 0L,
                   # Each unit's sampling covariance is a single positive variance here, so there is
                   # no block that can fail to be positive definite.
-                  num_units_not_positive_definite = 0L)
+                  num_units_not_positive_definite = 0L) |>
+      bind_cols(prior_covariance_tibble())
     if (nrow(usable) < MIN_UNITS_FOR_FIT) {
       return(row)
     }

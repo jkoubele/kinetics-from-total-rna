@@ -3,6 +3,8 @@
 import argparse
 from pathlib import Path
 
+import torch
+
 from rna_kinetics.data import load_dataset_metadata, load_gene_data_list, concat_gene_data_list
 from rna_kinetics.estimation import get_global_rna_kinetics_model_results
 
@@ -19,6 +21,13 @@ if __name__ == "__main__":
     parser.add_argument('--lrt_metadata', type=Path, required=True)
     parser.add_argument('--reduced_matrices_folder', type=Path, required=True)
     parser.add_argument('--output_folder', type=Path, default=Path('.'))
+    parser.add_argument('--plug_in_coverage_fits',
+                        type=Path,
+                        default=None,
+                        help='Path to the merged intron coverage fits, whose '
+                             'lfc_elong_over_splice and intercept_pi_logit are then held fixed. '
+                             'Omitting it fits the joint likelihood over the counts and the '
+                             'coverage shape together.')
     args = parser.parse_args()
 
     args.output_folder.mkdir(exist_ok=True, parents=True)
@@ -42,9 +51,18 @@ if __name__ == "__main__":
 
     global_gene_data = concat_gene_data_list(gene_data_list)
 
+
+    # `None` where no fits were given, which is what turns the plug-in off: the model then
+    # estimates `lfc_elong_over_splice` and `intercept_pi_logit` from the joint likelihood.
+    plug_in_coverage_fits = None
+    if args.plug_in_coverage_fits is not None:
+        plug_in_coverage_fits = torch.load(args.plug_in_coverage_fits,
+                                           weights_only=False).fits
+
     model_param_df, test_results_df = get_global_rna_kinetics_model_results(
         global_gene_data=global_gene_data,
         dataset_metadata=dataset_metadata,
+        plug_in_coverage_fits=plug_in_coverage_fits,
         verbose=True,
     )
 

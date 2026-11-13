@@ -27,12 +27,19 @@ custom_gene_list: null # Optional path to a CSV file with genes to fit the model
 
 design_formula: "~your+design+formula" # Design formula, specified as formulas in R.
 
-fit_rna_kinetics_model: true
+fit_gene_specific_rna_kinetics_model: true
 fit_intron_specific_rna_kinetics_model: false
 fit_global_rna_kinetics_model: true
 fit_global_intron_coverage_model: true
 fit_gene_specific_intron_coverage_model: true
 fit_intron_specific_intron_coverage_model: false
+
+# Estimate lfc_elong_over_splice from the intron coverage shape first, then hold it fixed while
+# fitting the read counts. Each RNA kinetics model then needs the intron coverage model of its own
+# granularity, which is switched on for you if you left it off. Set this to false to fit the joint
+# likelihood over counts and coverage shape together, which we do not recommend; those results are
+# written to a separate *_joint_likelihood folder.
+use_plug_in_coverage: true
 
 contrasts: # List of contrasts for likelihood ratio tests.
   - variable: "your_categorical_variable_to_test" # For categorical variables, please specify groups (levels) that you want to compare

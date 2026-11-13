@@ -28,6 +28,13 @@ if __name__ == "__main__":
                         default='',
                         help='Suffix for the output CSV files.')
 
+    parser.add_argument('--plug_in_coverage_fits',
+                        type=Path,
+                        default=None,
+                        help='Path to the merged intron coverage fits, whose '
+                             'lfc_elong_over_splice and intercept_pi_logit are then held fixed. '
+                             'Omitting it fits the joint likelihood over the counts and the '
+                             'coverage shape together.')
     args = parser.parse_args()
     output_folder = args.output_folder
     output_folder.mkdir(exist_ok=True, parents=True)
@@ -40,12 +47,21 @@ if __name__ == "__main__":
                                           map_location=device)
     dataset_metadata = cache_for_regularization.dataset_metadata
     intron_specific_lfc = cache_for_regularization.intron_specific_lfc
+
+    # `None` where no fits were given, which is what turns the plug-in off: the model then
+    # estimates `lfc_elong_over_splice` and `intercept_pi_logit` from the joint likelihood.
+    plug_in_coverage_fits = None
+    if args.plug_in_coverage_fits is not None:
+        plug_in_coverage_fits = torch.load(args.plug_in_coverage_fits,
+                                           weights_only=False).fits
+
     result_list = [
         get_regularized_rna_kinetics_model_results(gene_data=gene_data,
                                                    dataset_metadata=dataset_metadata,
                                                    intron_specific_lfc=intron_specific_lfc,
                                                    hot_start_state_dict=model_state_dict,
                                                    regularization_coefficients_df=regularization_coefficients_df,
+                                                   plug_in_coverage_fits=plug_in_coverage_fits,
                                                    device=device)
         for gene_data, model_state_dict in tqdm(cache_for_regularization.training_input_per_gene)]
 
