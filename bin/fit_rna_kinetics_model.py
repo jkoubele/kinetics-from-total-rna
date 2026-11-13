@@ -66,6 +66,13 @@ if __name__ == "__main__":
                         type=parse_bool_in_argparse,
                         required=True,
                         help='Whether to use intron-specific LFC (true or false).')
+    parser.add_argument('--plug_in_coverage_fits',
+                        type=Path,
+                        default=None,
+                        help='Path to the merged intron coverage fits, whose '
+                             'lfc_elong_over_splice and intercept_pi_logit are then held fixed. '
+                             'Omitting it fits the joint likelihood over the counts and the '
+                             'coverage shape together.')
     parser.add_argument('--output_folder',
                         type=Path,
                         default=Path('.'),
@@ -91,9 +98,18 @@ if __name__ == "__main__":
                                          coverage_folder=args.coverage_data_folder,
                                          sample_names=dataset_metadata.sample_names)
 
+
+    # `None` where no fits were given, which is what turns the plug-in off: the model then
+    # estimates `lfc_elong_over_splice` and `intercept_pi_logit` from the joint likelihood.
+    plug_in_coverage_fits = None
+    if args.plug_in_coverage_fits is not None:
+        plug_in_coverage_fits = torch.load(args.plug_in_coverage_fits,
+                                           weights_only=False).fits
+
     result_list = [get_rna_kinetics_model_results(gene_data=gene_data,
                                                   dataset_metadata=dataset_metadata,
-                                                  intron_specific_lfc=args.intron_specific_lfc)
+                                                  intron_specific_lfc=args.intron_specific_lfc,
+                                                  plug_in_coverage_fits=plug_in_coverage_fits)
                    for gene_data in tqdm(gene_data_list)]
 
     state_dicts_list: list[StateDict] = [result.state_dict_full_model for result in result_list]

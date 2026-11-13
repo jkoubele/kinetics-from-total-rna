@@ -1,10 +1,25 @@
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
+
+# Every tensor the models see, and every parameter they hold. Single precision costs more than it
+# saves here: the optimizer's `tolerance_grad` is absolute, and the gradient of a Poisson loss of
+# order 1e5 cannot be computed to better than about 1e-5 in float32, so the criterion is
+# unreachable and the fit runs to its epoch limit instead of stopping when it has converged. It
+# ends up both less accurate and slower, and the stopping point depends on the order the BLAS
+# happens to accumulate in, so the same input gives different estimates on different machines.
+#
+# Set as the process-wide default as well as used explicitly below, because the models build
+# their parameters with `torch.zeros` and would otherwise take single precision from torch while
+# their data arrived in double. Importing this package therefore changes `torch`'s default dtype,
+# which is a side effect worth knowing about if it is ever imported beside other torch code.
+MODEL_DTYPE = torch.float64
+torch.set_default_dtype(MODEL_DTYPE)
 
 
 @dataclass
@@ -137,7 +152,7 @@ def load_dataset_metadata(design_matrix_file: Path,
                                               left_on='sample',
                                               right_on='sample')
     library_sizes = torch.tensor(design_matrix_df.pop('library_size_factor'),
-                                 dtype=torch.float32)
+                                 dtype=MODEL_DTYPE)
     design_matrix_df = design_matrix_df.set_index('sample')
 
     lrt_metadata = pd.read_csv(lrt_metadata_file, sep='\t').set_index('test_id', drop=False)
@@ -150,9 +165,9 @@ def load_dataset_metadata(design_matrix_file: Path,
                 f"Reduced matrix index {reduced_matrix_df.index} does not equal to design matrix index {design_matrix_df.index}.")
         _validate_reduced_matrix(design_matrix_df.values, reduced_matrix_df.values,
                                  int(lrt_metadata.loc[test_id, 'lrt_df']), test_id)
-        reduced_matrices[test_id] = torch.tensor(reduced_matrix_df.values, dtype=torch.float32)
+        reduced_matrices[test_id] = torch.tensor(reduced_matrix_df.values, dtype=MODEL_DTYPE)
 
-    dataset_metadata = DatasetMetadata(design_matrix=torch.tensor(design_matrix_df.values, dtype=torch.float32),
+    dataset_metadata = DatasetMetadata(design_matrix=torch.tensor(design_matrix_df.values, dtype=MODEL_DTYPE),
                                        library_sizes=library_sizes,
                                        log_library_sizes=torch.log(library_sizes),
                                        feature_names=design_matrix_df.columns.tolist(),
@@ -199,25 +214,30 @@ def load_gene_data_list(modeled_genes_file: Path,
     for gene_id in tqdm(modeled_genes_df['gene_id'], desc='Preparing gene data'):
         exon_row = exon_counts_df.loc[gene_id]
 
+        if gene_id not in gene_to_introns:
+            raise ValueError(f'Gene {gene_id} is modeled but has no intron in '
+                             f'{modeled_introns_file}. Every modeled gene must have at least one '
+                             f'modeled intron.')
+
         # Sort introns by position in the gene
         gene_intron_names = sorted(
             gene_to_introns[gene_id],
             key=lambda x: int(x.rsplit('_', maxsplit=1)[1]),
         )
 
-        exon_reads = torch.tensor(exon_row.values, dtype=torch.float32)
-        intron_reads = torch.tensor(intron_counts_df.loc[gene_intron_names].values, dtype=torch.float32).T
+        exon_reads = torch.tensor(exon_row.values, dtype=MODEL_DTYPE)
+        intron_reads = torch.tensor(intron_counts_df.loc[gene_intron_names].values, dtype=MODEL_DTYPE).T
 
         coverage = torch.tensor(np.stack([
             np.stack([coverage_df_by_sample[sample].loc[intron].values for intron in gene_intron_names])
             for sample in sample_names
-        ]), dtype=torch.float32)
+        ]), dtype=MODEL_DTYPE)
 
         if not torch.allclose(coverage.sum(axis=2), intron_reads):
             raise ValueError(f'Intron coverage for gene {gene_id} does not sum up to its intron read counts.')
 
         isoform_length_factors = torch.tensor(isoform_length_factors_df.loc[gene_id].values,
-                                              dtype=torch.float32)
+                                              dtype=MODEL_DTYPE)
         isoform_length_offset = torch.log(isoform_length_factors)
 
         gene_data = GeneData(gene_name=gene_id,
@@ -235,8 +255,16 @@ def load_intron_coverage_list(
         modeled_introns_file: Path,
         coverage_folder: Path,
         sample_names: list[str],
+        modeled_genes_file: Optional[Path] = None,
 ) -> list[IntronData]:
     introns_df = pd.read_csv(modeled_introns_file, sep='\t')
+
+    # Lets a per-intron fit be driven by the same gene chunk file as a per-gene fit, so the two
+    # cover the same genes by construction rather than through a second chunking of the introns
+    # that would have to be kept in step with the gene chunks.
+    if modeled_genes_file is not None:
+        modeled_genes_df = pd.read_csv(modeled_genes_file, sep='\t')
+        introns_df = introns_df[introns_df['gene_id'].isin(set(modeled_genes_df['gene_id']))]
 
     coverage_df_by_sample: dict[str, pd.DataFrame] = {}
     for sample_name in tqdm(sample_names, desc='Loading coverage data'):
@@ -251,7 +279,7 @@ def load_intron_coverage_list(
         coverage = torch.tensor(np.stack([
             coverage_df_by_sample[sample].loc[intron_id].values
             for sample in sample_names
-        ]), dtype=torch.float32).unsqueeze(1)  # (num_samples, 1, num_coverage_bins)
+        ]), dtype=MODEL_DTYPE).unsqueeze(1)  # (num_samples, 1, num_coverage_bins)
         intron_data_list.append(IntronData(intron_name=intron_id, gene_name=gene_id, coverage=coverage))
 
     return intron_data_list

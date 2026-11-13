@@ -30,6 +30,11 @@ the [rna_kinetics](rna_kinetics) folder
 > underlying physical model of the RNA metabolism, and the inference model implemented in this
 > repository. We therefore recommend reading these sections if you want to understand what the
 > pipeline is fitting.
+>
+> The code is also slightly ahead of this draft. The two-stage estimator the pipeline now uses by
+> default, which fits the intron coverage shape first and holds the result fixed while fitting the
+> read counts, is not described there yet, and the regularization works somewhat differently from
+> what the draft says.
 
 ## What the model estimates
 
@@ -51,14 +56,17 @@ column of the output:
 | `lfc_init_over_splice` | LFC(initiation rate) − LFC(splicing speed) |
 | `lfc_elong_over_splice` | LFC(elongation speed) − LFC(splicing speed) |
 
-All six ratios of the four rates are tested. Only three of them can be independent: once three are
-known, the remaining three are differences of those. Which three the code carries as its parameters
-is an implementation detail, and any other choice of three would describe the same model. The RNA
-kinetics model uses the three ratios against the degradation rate, which makes the other three
-differences of two (for example `lfc_elong_over_splice` = `lfc_elong_over_deg` −
-`lfc_splice_over_deg`), while the intron coverage model parametrizes `lfc_elong_over_splice`
-directly, since that is the only ratio it can see. The ratios against the degradation rate are
-therefore a matter of convenience.
+All six ratios are tested, but they span a space of only three dimensions. Each of them is a
+difference of the LFCs of two rates, as the table above shows, and four rates give only three
+independent differences. Each model is parametrized by a basis of this space, and the remaining
+ratios follow from it as linear combinations. Which basis the code uses is an implementation detail,
+since every basis describes the same model. The RNA kinetics models use `lfc_init_over_deg`,
+`lfc_elong_over_splice` and `lfc_splice_over_deg`, from which their predicted read counts and
+coverage profiles are built directly. The other ratios are then recovered from these, for example
+`lfc_elong_over_deg` = `lfc_elong_over_splice` + `lfc_splice_over_deg`. The intron coverage models
+have a single parameter, `lfc_elong_over_splice`, because the coverage profile provides no
+information about the other ratios. It is the same quantity that the RNA kinetics models estimate,
+and it carries the same name.
 
 Therefore, a significant result tells us which pair of rates has changed relative to each other, but
 not which member of the pair is responsible for the change. For example, a positive
@@ -124,8 +132,21 @@ The six resulting models are listed below. Each cell of the table gives the para
 | Granularity | RNA kinetics model | Intron coverage model |
 | --- | --- | --- |
 | **Global**, one effect for the whole dataset | *fit_global_rna_kinetics_model* | *fit_global_intron_coverage_model* |
-| **Per gene**, one effect per gene, shared by its introns | *fit_rna_kinetics_model* | *fit_gene_specific_intron_coverage_model* |
+| **Per gene**, one effect per gene, shared by its introns | *fit_gene_specific_rna_kinetics_model* | *fit_gene_specific_intron_coverage_model* |
 | **Per intron**, a separate effect for every intron | *fit_intron_specific_rna_kinetics_model* | *fit_intron_specific_intron_coverage_model* |
+
+An RNA kinetics model is fitted in two stages. The intron coverage model of the same granularity
+is fitted first, which identifies the elongation over splicing effect from the shape of the intron
+coverage alone, and that estimate is then held fixed while the read counts are fitted. So enabling
+an RNA kinetics model also enables the intron coverage model it reads; if you left that one off,
+the pipeline switches it on and says so. The standard errors of the second stage account for the
+first stage having been estimated rather than known.
+
+You can instead fit both stages at once, by setting ```use_plug_in_coverage``` to false. We do not
+recommend it: one gene's intron coverage carries far less information about the elongation over
+splicing effect than its read counts carry about everything else, so a joint fit lets the counts
+pull that effect away from what the coverage shape supports. Those results are written to a
+separate ```*_joint_likelihood``` folder, so the two can be compared side by side.
 
 We recommend starting with the global and per-gene models of both families, which is also the
 default setting in the [dataset_params_template.yaml](dataset_params_template.yaml) file. The global
