@@ -399,9 +399,20 @@ def train_model(
         evaluate_loss: Callable[[], torch.Tensor],
         max_epochs=200,
         max_patience=3,
-        loss_change_tolerance=1e-6,
+        loss_change_tolerance=1e-5,
         verbose: bool = False,
 ) -> tuple[nn.Module, TrainingResults]:
+    """
+    Train a model in epochs of `optimizer.step(closure)`, and return it at its lowest loss.
+
+    The model is restored to the best state seen, including the starting one, so training never
+    returns a model worse than it was given. A non-finite loss stops training and is reported as
+    `training_diverged`, with the model restored to its last finite best.
+
+    Training stops once the loss has changed by less than `loss_change_tolerance` (in nats) for
+    `max_patience` epochs in a row. The change is absolute rather than relative because the
+    losses keep arbitrary constant terms.
+    """
     previous_loss = None
     patience_counter = 0
 
@@ -432,8 +443,7 @@ def train_model(
             best_state_dict = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
         if previous_loss is not None:
-            relative_loss_change = abs(loss - previous_loss) / (abs(previous_loss) + 1e-10)
-            if relative_loss_change < loss_change_tolerance:
+            if abs(loss - previous_loss) < loss_change_tolerance:
                 patience_counter += 1
                 if patience_counter >= max_patience:
                     converged_within_max_epochs = True
@@ -681,6 +691,8 @@ def _make_rna_kinetics_closures(
             predicted_reads_exon=predicted_reads_exon,
             predicted_reads_intron=predicted_reads_intron,
             predicted_pi=predicted_pi,
+            exon_count_dispersion=gene_data.exon_count_dispersion,
+            intron_count_dispersion=gene_data.intron_count_dispersion,
         )
         if prior_precision is not None:
             loss += get_prior_penalty(model, prior_precision)
@@ -1798,7 +1810,9 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
                                 intron_coverage=gene_data.coverage,
                                 predicted_reads_exon=predicted_reads_exon,
                                 predicted_reads_intron=predicted_reads_intron,
-                                predicted_pi=predicted_pi)
+                                predicted_pi=predicted_pi,
+                                exon_count_dispersion=gene_data.exon_count_dispersion,
+                                intron_count_dispersion=gene_data.intron_count_dispersion)
 
     fisher_information_matrix = get_fisher_information_matrix(model_full, rna_kinetics_loss_by_params)
     if plug_in_coverage is None:
@@ -2159,6 +2173,8 @@ def _make_global_rna_kinetics_closures(
             predicted_reads_exon=predicted_reads_exon,
             predicted_reads_intron=predicted_reads_intron,
             predicted_pi=predicted_pi,
+            exon_count_dispersion=global_gene_data.exon_count_dispersion,
+            intron_count_dispersion=global_gene_data.intron_count_dispersion,
         )
 
     return _make_closures(optimizer, _compute_loss)

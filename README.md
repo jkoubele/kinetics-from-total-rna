@@ -149,6 +149,12 @@ splicing effect than its read counts carry about everything else, so a joint fit
 pull that effect away from what the coverage shape supports. Those results are written to a
 separate ```*_joint_likelihood``` folder, so the two can be compared side by side.
 
+The read counts of an RNA kinetics model follow a negative binomial distribution, with
+dispersions estimated by [DESeq2](https://bioconductor.org/packages/DESeq2/) and held fixed;
+see ```count_distribution``` in the [dataset_params_template.yaml](dataset_params_template.yaml)
+file for details. The intron coverage models are not affected by this, since the read counts do
+not enter them.
+
 We recommend starting with the global and per-gene models of both families, which is also the
 default setting in the [dataset_params_template.yaml](dataset_params_template.yaml) file. The global
 models tell you whether there is a dataset-wide shift, and they are well powered even for small
