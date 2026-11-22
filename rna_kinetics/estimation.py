@@ -1356,8 +1356,8 @@ def add_wald_test_results(df_param: pd.DataFrame,
     df_param['identifiable'] = df_param.index.isin(identifiable_indices)
     df_param.loc[identifiable_indices, 'SE'] = standard_errors
     df_param.loc[identifiable_indices, 'z_score'] = df_param.loc[identifiable_indices, 'value'] / standard_errors
-    df_param.loc[identifiable_indices, 'p_value_wald'] = 2 * (
-            1 - stats.norm.cdf(np.abs(df_param.loc[identifiable_indices, 'z_score'])))
+    df_param.loc[identifiable_indices, 'p_value_wald'] = 2 * stats.norm.sf(
+        np.abs(df_param.loc[identifiable_indices, 'z_score']))
 
     return df_param
 
@@ -1483,7 +1483,7 @@ def get_contrast_wald_results(parameter_covariance: Optional[ParameterCovariance
     z_score = lfc / standard_error if standard_error > 0 else np.nan
     return {'lfc_se': standard_error,
             'z_score': z_score,
-            'p_value_wald': 2 * (1 - stats.norm.cdf(np.abs(z_score))),
+            'p_value_wald': 2 * stats.norm.sf(np.abs(z_score)),
             'lfc_identifiable': True}
 
 
@@ -1883,8 +1883,8 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
         test_result['loss_reduced_model'] = results_reduced.final_loss
         test_result['chi2_test_statistics'] = 2 * (results_reduced.final_loss
                                                    - results_full.final_loss)
-        test_result['p_value'] = 1 - stats.chi2.cdf(test_result['chi2_test_statistics'],
-                                                    df=test_result['lrt_df'])
+        test_result['p_value'] = stats.chi2.sf(test_result['chi2_test_statistics'],
+                                                df=test_result['lrt_df'])
         test_result['num_full_model_restarts'] = fits.num_full_model_restarts
         test_results_list.append(test_result)
 
@@ -2130,7 +2130,7 @@ def get_intron_coverage_model_results(
         test_result['loss_full_model'] = results_full.final_loss
         test_result['loss_reduced_model'] = results_reduced.final_loss
         test_result['chi2_test_statistics'] = chi2_stat
-        test_result['p_value'] = 1 - stats.chi2.cdf(chi2_stat, df=lrt_row['lrt_df'])
+        test_result['p_value'] = stats.chi2.sf(chi2_stat, df=lrt_row['lrt_df'])
         test_result['training_diverged_reduced_model'] = results_reduced.training_diverged
         test_result['training_converged_within_max_epochs_reduced_model'] = results_reduced.converged_within_max_epochs
         test_result['num_epochs_reduced_model'] = results_reduced.num_epochs
@@ -2355,7 +2355,7 @@ def get_global_rna_kinetics_model_results(
         test_result['loss_full_model'] = training_results.final_loss
         test_result['loss_reduced_model'] = results_reduced.final_loss
         test_result['chi2_test_statistics'] = chi2_stat
-        test_result['p_value'] = 1 - stats.chi2.cdf(chi2_stat, df=lrt_row['lrt_df'])
+        test_result['p_value'] = stats.chi2.sf(chi2_stat, df=lrt_row['lrt_df'])
         test_result['training_diverged_reduced_model'] = results_reduced.training_diverged
         test_result[
             'training_converged_within_max_epochs_reduced_model'] = results_reduced.converged_within_max_epochs
