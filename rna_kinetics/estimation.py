@@ -2183,6 +2183,12 @@ def _make_global_rna_kinetics_closures(
 # The global models train in two passes and can need many more epochs than a per-gene fit, which
 # `train_model` caps at its own, lower default.
 MAX_EPOCHS_GLOBAL_MODEL = 1000
+# LBFGS converges slowly on the global models, which hold one intercept per gene or intron, and
+# would keep improving the loss by small amounts for far longer than the reported LFCs and LRT
+# statistics take to settle. The per-gene fits converge on LBFGS's own criterion and keep the
+# tighter default of `train_model`.
+LOSS_CHANGE_TOLERANCE_GLOBAL_MODEL = 1e-2
+MAX_PATIENCE_GLOBAL_MODEL = 5
 
 
 def _train_global_model(
@@ -2217,7 +2223,10 @@ def _train_global_model(
         )
         closure_pass_1, eval_pass_1 = make_closures(optimizer_pass_1)
         model, _ = train_model(model, optimizer_pass_1, closure_pass_1, eval_pass_1,
-                               max_epochs=MAX_EPOCHS_GLOBAL_MODEL, verbose=verbose)
+                               max_epochs=MAX_EPOCHS_GLOBAL_MODEL,
+                               max_patience=MAX_PATIENCE_GLOBAL_MODEL,
+                               loss_change_tolerance=LOSS_CHANGE_TOLERANCE_GLOBAL_MODEL,
+                               verbose=verbose)
 
     # Pass 2: unfreeze all, refine every parameter from the warm start
     if verbose:
@@ -2228,6 +2237,8 @@ def _train_global_model(
     closure_pass_2, eval_pass_2 = make_closures(optimizer_pass_2)
     model, training_results = train_model(model, optimizer_pass_2, closure_pass_2, eval_pass_2,
                                           max_epochs=MAX_EPOCHS_GLOBAL_MODEL,
+                                          max_patience=MAX_PATIENCE_GLOBAL_MODEL,
+                                          loss_change_tolerance=LOSS_CHANGE_TOLERANCE_GLOBAL_MODEL,
                                           verbose=verbose)
     return model, training_results
 
