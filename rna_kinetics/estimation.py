@@ -2187,7 +2187,7 @@ MAX_EPOCHS_GLOBAL_MODEL = 1000
 # would keep improving the loss by small amounts for far longer than the reported LFCs and LRT
 # statistics take to settle. The per-gene fits converge on LBFGS's own criterion and keep the
 # tighter default of `train_model`.
-LOSS_CHANGE_TOLERANCE_GLOBAL_MODEL = 1e-2
+LOSS_CHANGE_TOLERANCE_GLOBAL_MODEL = 1e-1
 MAX_PATIENCE_GLOBAL_MODEL = 5
 
 
