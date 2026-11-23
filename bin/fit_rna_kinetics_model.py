@@ -7,7 +7,7 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from rna_kinetics.data import load_dataset_metadata, load_gene_data_list
+from rna_kinetics.data import CountDistribution, load_dataset_metadata, load_gene_data_list
 from rna_kinetics.estimation import get_rna_kinetics_model_results, CacheForRegularization, StateDict
 
 
@@ -73,6 +73,20 @@ if __name__ == "__main__":
                              'lfc_elong_over_splice and intercept_pi_logit are then held fixed. '
                              'Omitting it fits the joint likelihood over the counts and the '
                              'coverage shape together.')
+    parser.add_argument('--count_distribution',
+                        type=CountDistribution,
+                        choices=list(CountDistribution),
+                        required=True,
+                        help='Distribution of the exon and intron read counts. The negative '
+                             'binomial needs both tables of count dispersions.')
+    parser.add_argument('--exon_count_dispersions',
+                        type=Path,
+                        default=None,
+                        help='Path to the TSV file with one count dispersion per gene.')
+    parser.add_argument('--intron_count_dispersions',
+                        type=Path,
+                        default=None,
+                        help='Path to the TSV file with one count dispersion per intron.')
     parser.add_argument('--output_folder',
                         type=Path,
                         default=Path('.'),
@@ -96,8 +110,10 @@ if __name__ == "__main__":
                                          intron_counts_file=args.intron_counts,
                                          isoform_length_factors_file=args.isoform_length_factors,
                                          coverage_folder=args.coverage_data_folder,
-                                         sample_names=dataset_metadata.sample_names)
-
+                                         sample_names=dataset_metadata.sample_names,
+                                         count_distribution=args.count_distribution,
+                                         exon_count_dispersions_file=args.exon_count_dispersions,
+                                         intron_count_dispersions_file=args.intron_count_dispersions)
 
     # `None` where no fits were given, which is what turns the plug-in off: the model then
     # estimates `lfc_elong_over_splice` and `intercept_pi_logit` from the joint likelihood.

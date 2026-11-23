@@ -999,11 +999,54 @@ class GlobalRNAKineticsModel(nn.Module):
         })
 
 
+# What `torch.nn.functional.poisson_nll_loss` adds to the mean before taking its logarithm. Used
+# for the negative binomial too, so that a predicted mean of zero is handled alike by both.
+POISSON_LOG_EPS = 1e-8
+
+
+def get_count_negative_log_likelihood(predicted_reads: torch.Tensor,
+                                      reads: torch.Tensor,
+                                      dispersion: Optional[torch.Tensor]) -> torch.Tensor:
+    """
+    Negative log-likelihood of read counts around their predicted means, summed.
+
+    Negative binomial with variance `mean + dispersion * mean^2`, where `dispersion` broadcasts
+    against `reads` and is a known constant rather than something fitted here. A dispersion of
+    zero is the Poisson distribution, the limit the negative binomial tends to, and takes the
+    Poisson formula since the general one divides by the dispersion. None is zero throughout.
+
+    Where the dispersion is positive, the terms that do not involve the mean are left out. With
+    the dispersion fixed they are the same constant under every hypothesis, and their `lgamma`
+    calls would make up most of the cost of each evaluation on a genome-wide model.
+    """
+    def get_poisson_loss() -> torch.Tensor:
+        return functional.poisson_nll_loss(predicted_reads, reads, log_input=False, full=True,
+                                           reduction='none')
+
+    if dispersion is None or not torch.any(dispersion > 0):
+        return get_poisson_loss().sum()
+
+    dispersion = dispersion.expand_as(reads)
+    is_overdispersed = dispersion > 0
+    # Stands in where the dispersion is zero, so that the branch `torch.where` discards there is
+    # still finite and passes back a zero gradient rather than a NaN.
+    positive_dispersion = torch.where(is_overdispersed, dispersion, torch.ones_like(dispersion))
+    inverse_dispersion = 1 / positive_dispersion
+
+    # Written with log1p so that a small dispersion loses no precision: this term tends to the
+    # predicted mean itself, which is the Poisson one.
+    mean_dependent_term = ((reads + inverse_dispersion) * torch.log1p(positive_dispersion * predicted_reads)
+                           - reads * torch.log(predicted_reads + POISSON_LOG_EPS))
+    # Every dispersion DESeq2 estimates is positive, so the Poisson formula is needed only where
+    # zero and positive dispersions are mixed.
+    if torch.all(is_overdispersed):
+        return mean_dependent_term.sum()
+    return torch.where(is_overdispersed, mean_dependent_term, get_poisson_loss()).sum()
+
+
 class RNAKineticsLoss(nn.Module):
     def __init__(self, num_position_coverage: int):
         super().__init__()
-        self.loss_function_exon_counts = nn.PoissonNLLLoss(log_input=False, full=True, reduction='sum')
-        self.loss_function_intron_counts = nn.PoissonNLLLoss(log_input=False, full=True, reduction='sum')
         self.loss_function_intron_coverage = CoverageLoss(num_position_coverage=num_position_coverage)
 
     def forward(self,
@@ -1012,17 +1055,25 @@ class RNAKineticsLoss(nn.Module):
                 intron_coverage: torch.Tensor,
                 predicted_reads_exon: torch.Tensor,
                 predicted_reads_intron: torch.Tensor,
-                predicted_pi: Optional[torch.Tensor]):
+                predicted_pi: Optional[torch.Tensor],
+                exon_count_dispersion: Optional[torch.Tensor] = None,
+                intron_count_dispersion: Optional[torch.Tensor] = None):
         """
         The three terms of the likelihood, summed.
+
+        The two count terms are negative binomial under the given dispersions, which are per gene
+        for the exon counts and per intron for the intron counts, and Poisson where those are
+        zero or left out. The exon count and the counts of the individual introns enter as
+        independent observations either way.
 
         A plug-in model predicts no pi, having taken it from a coverage fit, and then the coverage
         term would be the same constant under every hypothesis. It is left out rather than added,
         so that the reported loss is the objective that was optimized.
         """
-        loss_exon_counts = self.loss_function_exon_counts(predicted_reads_exon,
-                                                          reads_exon)
-        loss_intron_counts = self.loss_function_intron_counts(predicted_reads_intron, reads_intron)
+        loss_exon_counts = get_count_negative_log_likelihood(predicted_reads_exon, reads_exon,
+                                                             exon_count_dispersion)
+        loss_intron_counts = get_count_negative_log_likelihood(predicted_reads_intron, reads_intron,
+                                                               intron_count_dispersion)
 
         total_loss = loss_exon_counts + loss_intron_counts
         if predicted_pi is not None:

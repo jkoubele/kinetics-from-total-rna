@@ -5,6 +5,7 @@ process WriteDesignMetadata {
     val design_formula
     val contrasts
     val use_plug_in_coverage
+    val count_distribution
 
     output:
     path "design.json"
@@ -13,10 +14,13 @@ process WriteDesignMetadata {
     script:
     // `use_plug_in_coverage` is recorded as it was requested. A kinetics model that ran under it
     // reports `intron_coverage` in its own `source_model` column, so the two together say which
-    // estimator produced any given row.
+    // estimator produced any given row. `count_distribution` is recorded as requested too: where
+    // the design leaves no replicates the negative binomial is fitted with dispersions of zero,
+    // which the published count dispersions then show.
     def design_obj = [
         design_formula       : design_formula,
         use_plug_in_coverage : use_plug_in_coverage,
+        count_distribution   : count_distribution,
     ]
 
     def design_json_str       = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(design_obj))
@@ -75,6 +79,41 @@ process GetModeledGenes {
 }
 
 
+process EstimateCountDispersions {
+    publishDir "${params.outdir}/modeling/${params.model_run_id}/count_dispersions", mode: 'copy'
+
+    input:
+    path samplesheet
+    val design_formula
+    path exon_counts_matrix
+    path intron_counts_matrix
+    path library_size_factors
+    path isoform_length_factors
+    path modelable_genes
+    path modelable_introns
+
+    output:
+    tuple path("exon_count_dispersions.tsv"), path("intron_count_dispersions.tsv"), emit: count_dispersions
+    path("*_count_dispersions.png"), optional: true
+    // Written only when the design leaves no replicates to estimate a dispersion from, in which
+    // case every dispersion is zero and the counts are fitted as Poisson.
+    path("count_dispersions_warning.txt"), optional: true, emit: warning
+
+    script:
+    """
+    estimate_count_dispersions.R \
+    --samplesheet $samplesheet \
+    --formula "$design_formula" \
+    --exon_counts $exon_counts_matrix \
+    --intron_counts $intron_counts_matrix \
+    --library_size_factors $library_size_factors \
+    --isoform_length_factors $isoform_length_factors \
+    --modelable_genes $modelable_genes \
+    --modelable_introns $modelable_introns
+    """
+}
+
+
 process FitRNAKineticsModel {
     input:
     tuple (
@@ -90,7 +129,10 @@ process FitRNAKineticsModel {
         path(isoform_length_factors),
         path(coverage_parquet_files),
         val(intron_specific_lfc),
-        path(plug_in_coverage_fits)
+        path(plug_in_coverage_fits),
+        path(exon_count_dispersions),
+        path(intron_count_dispersions),
+        val(count_distribution)
     )
 
     output:
@@ -105,6 +147,10 @@ process FitRNAKineticsModel {
     // Empty where the joint likelihood is being fitted instead, which stages no file and
     // leaves the argument off, rather than passing a path the script would have to ignore.
     def plug_in_argument = plug_in_coverage_fits ? "--plug_in_coverage_fits ${plug_in_coverage_fits}" : ''
+    // Empty under Poisson, which has no dispersions to read.
+    def dispersions_argument = exon_count_dispersions
+        ? "--exon_count_dispersions ${exon_count_dispersions} --intron_count_dispersions ${intron_count_dispersions}"
+        : ''
     """
     export PYTHONPATH='${baseDir}'\${PYTHONPATH:+:\$PYTHONPATH}
     fit_rna_kinetics_model.py \
@@ -119,6 +165,8 @@ process FitRNAKineticsModel {
     --lrt_metadata ${lrt_metadata} \
     --reduced_matrices_folder ${reduced_matrices_folder} \
     --intron_specific_lfc ${intron_specific_lfc} \
+    --count_distribution ${count_distribution} \
+    ${dispersions_argument} \
     ${plug_in_argument} \
     --output_folder . \
     --output_name_suffix _${chunk_name}
@@ -251,6 +299,9 @@ process FitGlobalRNAKineticsModel {
         path(isoform_length_factors),
         path(coverage_parquet_files),
         path(plug_in_coverage_fits),
+        path(exon_count_dispersions),
+        path(intron_count_dispersions),
+        val(count_distribution),
         val(model_type_subfolder)
     )
 
@@ -262,6 +313,10 @@ process FitGlobalRNAKineticsModel {
     // Empty where the joint likelihood is being fitted instead, which stages no file and
     // leaves the argument off, rather than passing a path the script would have to ignore.
     def plug_in_argument = plug_in_coverage_fits ? "--plug_in_coverage_fits ${plug_in_coverage_fits}" : ''
+    // Empty under Poisson, which has no dispersions to read.
+    def dispersions_argument = exon_count_dispersions
+        ? "--exon_count_dispersions ${exon_count_dispersions} --intron_count_dispersions ${intron_count_dispersions}"
+        : ''
     """
     export PYTHONPATH='${baseDir}'\${PYTHONPATH:+:\$PYTHONPATH}
     fit_global_rna_kinetics_model.py \
@@ -275,6 +330,8 @@ process FitGlobalRNAKineticsModel {
     --coverage_data_folder . \
     --lrt_metadata ${lrt_metadata} \
     --reduced_matrices_folder ${reduced_matrices_folder} \
+    --count_distribution ${count_distribution} \
+    ${dispersions_argument} \
     ${plug_in_argument}
     mv test_results.tsv test_results_raw.tsv
     """
@@ -521,6 +578,8 @@ workflow gene_specific_rna_kinetics_model_subworkflow {
         regularized_plug_in_coverage_fits
         coverage_test_results
         use_plug_in_coverage
+        count_dispersions
+        count_distribution
 
     main:
         // The joint likelihood writes to its own folder, so which estimator produced
@@ -545,9 +604,16 @@ workflow gene_specific_rna_kinetics_model_subworkflow {
 
         // The plug-in route attaches the merged coverage fits. The joint one attaches an empty
         // list, which stages no file and so leaves the argument off the command line.
-        def model_input = use_plug_in_coverage
+        def model_input_without_dispersions = use_plug_in_coverage
             ? model_input_without_coverage_fits.combine(plug_in_coverage_fits)
             : model_input_without_coverage_fits.map { chunk_input -> chunk_input + [[]] }
+
+        // The negative binomial attaches the two tables of count dispersions. Poisson has none
+        // and attaches two empty lists, which leaves both arguments off the command line.
+        def model_input = (count_distribution == 'negative_binomial'
+            ? model_input_without_dispersions.combine(count_dispersions)
+            : model_input_without_dispersions.map { chunk_input -> chunk_input + [[], []] })
+            .map { chunk_input -> chunk_input + [count_distribution] }
 
         def fit_output = FitRNAKineticsModel(model_input)
 
@@ -607,6 +673,8 @@ workflow intron_specific_rna_kinetics_model_subworkflow {
         regularized_plug_in_coverage_fits
         coverage_test_results
         use_plug_in_coverage
+        count_dispersions
+        count_distribution
 
     main:
         // The joint likelihood writes to its own folder, so which estimator produced
@@ -631,9 +699,16 @@ workflow intron_specific_rna_kinetics_model_subworkflow {
 
         // The plug-in route attaches the merged coverage fits. The joint one attaches an empty
         // list, which stages no file and so leaves the argument off the command line.
-        def model_input = use_plug_in_coverage
+        def model_input_without_dispersions = use_plug_in_coverage
             ? model_input_without_coverage_fits.combine(plug_in_coverage_fits)
             : model_input_without_coverage_fits.map { chunk_input -> chunk_input + [[]] }
+
+        // The negative binomial attaches the two tables of count dispersions. Poisson has none
+        // and attaches two empty lists, which leaves both arguments off the command line.
+        def model_input = (count_distribution == 'negative_binomial'
+            ? model_input_without_dispersions.combine(count_dispersions)
+            : model_input_without_dispersions.map { chunk_input -> chunk_input + [[], []] })
+            .map { chunk_input -> chunk_input + [count_distribution] }
 
         def fit_output = FitRNAKineticsModel(model_input)
 
@@ -864,6 +939,8 @@ workflow global_rna_kinetics_model_subworkflow {
         plug_in_coverage_fits
         coverage_test_results
         use_plug_in_coverage
+        count_dispersions
+        count_distribution
 
     main:
         // The joint likelihood writes to its own folder, so which estimator produced
@@ -885,11 +962,17 @@ workflow global_rna_kinetics_model_subworkflow {
 
         // The plug-in route attaches the single genome-wide coverage fit. The joint one attaches
         // an empty list, which stages no file and so leaves the argument off the command line.
+        def fit_input_without_dispersions = use_plug_in_coverage
+            ? fit_input_without_coverage_fits.combine(plug_in_coverage_fits)
+            : fit_input_without_coverage_fits.map { fit_input -> fit_input + [[]] }
+
+        // The negative binomial attaches the two tables of count dispersions. Poisson has none
+        // and attaches two empty lists, which leaves both arguments off the command line.
         def fit_output = FitGlobalRNAKineticsModel(
-            (use_plug_in_coverage
-                ? fit_input_without_coverage_fits.combine(plug_in_coverage_fits)
-                : fit_input_without_coverage_fits.map { fit_input -> fit_input + [[]] })
-                .map { fit_input -> fit_input + [model_subfolder] }
+            (count_distribution == 'negative_binomial'
+                ? fit_input_without_dispersions.combine(count_dispersions)
+                : fit_input_without_dispersions.map { fit_input -> fit_input + [[], []] })
+                .map { fit_input -> fit_input + [count_distribution, model_subfolder] }
         )
 
         def test_results = use_plug_in_coverage
@@ -951,8 +1034,13 @@ workflow modeling_workflow {
         fit_gene_specific_intron_coverage_model
         fit_intron_specific_intron_coverage_model
         use_plug_in_coverage
+        count_distribution
 
     main:
+        if (!(count_distribution in ['negative_binomial', 'poisson'])) {
+            error "count_distribution must be 'negative_binomial' or 'poisson', got '${count_distribution}'."
+        }
+
         def samplesheet = Channel.value(file(samplesheet_input))
 
         def stratified_plot_input = coverage_files_input
@@ -965,7 +1053,8 @@ workflow modeling_workflow {
 
         def design_metadata = WriteDesignMetadata(design_formula,
                                                  contrasts,
-                                                 use_plug_in_coverage)
+                                                 use_plug_in_coverage,
+                                                 count_distribution)
 
         def design_matrices_data = CreateDesignMatrices(
             samplesheet,
@@ -978,6 +1067,28 @@ workflow modeling_workflow {
                 .combine(modelable_genes_input)
                 .combine(modelable_introns_input)
         )
+
+        // The coverage models have no read counts in their likelihood, so the dispersions are
+        // estimated only where an RNA kinetics model will read them. They are estimated over
+        // every modelable gene and intron rather than this run's selection of them, so that a
+        // custom gene list changes neither the values nor whether a trend can be fitted.
+        def fits_rna_kinetics_model = fit_gene_specific_rna_kinetics_model
+            || fit_intron_specific_rna_kinetics_model || fit_global_rna_kinetics_model
+        def count_dispersions = channel.empty()
+        if (count_distribution == 'negative_binomial' && fits_rna_kinetics_model) {
+            def count_dispersions_output = EstimateCountDispersions(
+                samplesheet,
+                design_formula,
+                exon_counts_input,
+                intron_counts_input,
+                library_size_factors_input,
+                isoform_length_factors_input,
+                modelable_genes_input,
+                modelable_introns_input
+            )
+            count_dispersions = count_dispersions_output.count_dispersions
+            count_dispersions_output.warning.subscribe { warning_file -> log.warn warning_file.text.trim() }
+        }
 
         // Each plug-in kinetics model is a stage two, so the coverage model it reads has to run.
         // Switching that on is the only way to honour the request, a plug-in having nothing to
@@ -1061,7 +1172,9 @@ workflow modeling_workflow {
                     ? gene_specific_coverage_output.regularized_plug_in_coverage_fits
                     : channel.empty(),
                 use_plug_in_coverage ? gene_specific_coverage_output.raw_test_results : channel.empty(),
-                use_plug_in_coverage
+                use_plug_in_coverage,
+                count_dispersions,
+                count_distribution
             )
         }
 
@@ -1083,7 +1196,9 @@ workflow modeling_workflow {
                     ? intron_specific_coverage_output.regularized_plug_in_coverage_fits
                     : channel.empty(),
                 use_plug_in_coverage ? intron_specific_coverage_output.raw_test_results : channel.empty(),
-                use_plug_in_coverage
+                use_plug_in_coverage,
+                count_dispersions,
+                count_distribution
             )
         }
 
@@ -1102,7 +1217,9 @@ workflow modeling_workflow {
                 use_plug_in_coverage ? global_coverage_output.plug_in_coverage_fits
                     : channel.empty(),
                 use_plug_in_coverage ? global_coverage_output.raw_test_results : channel.empty(),
-                use_plug_in_coverage
+                use_plug_in_coverage,
+                count_dispersions,
+                count_distribution
             )
         }
 }

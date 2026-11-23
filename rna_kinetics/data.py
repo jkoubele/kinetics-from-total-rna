@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +21,18 @@ from tqdm import tqdm
 # which is a side effect worth knowing about if it is ever imported beside other torch code.
 MODEL_DTYPE = torch.float64
 torch.set_default_dtype(MODEL_DTYPE)
+
+
+class CountDistribution(StrEnum):
+    """
+    Distribution of the exon and intron read counts in the RNA kinetics models.
+
+    The negative binomial takes its dispersions as known, one per gene for the exon count and one
+    per intron for the intron count, estimated beforehand by DESeq2. The coverage term of the
+    likelihood is the same under both distributions.
+    """
+    POISSON = 'poisson'
+    NEGATIVE_BINOMIAL = 'negative_binomial'
 
 
 @dataclass
@@ -64,12 +77,24 @@ class GeneData:
     intron_reads: torch.Tensor  # shape (num_samples, num_introns)
     coverage: torch.Tensor  # shape (num_samples, num_introns, num_coverage_bins)
     isoform_length_offset: torch.Tensor  # shape (num_samples,)
+    # Dispersions of the negative binomial count model, with variance `mean + dispersion * mean^2`.
+    # Zero is the Poisson distribution, which is also what leaving them out gives.
+    exon_count_dispersion: Optional[torch.Tensor] = None  # shape ()
+    intron_count_dispersion: Optional[torch.Tensor] = None  # shape (num_introns,)
+
+    def __post_init__(self):
+        if self.exon_count_dispersion is None:
+            self.exon_count_dispersion = torch.zeros((), dtype=MODEL_DTYPE)
+        if self.intron_count_dispersion is None:
+            self.intron_count_dispersion = torch.zeros(len(self.intron_names), dtype=MODEL_DTYPE)
 
     def to(self, device):
         self.exon_reads = self.exon_reads.to(device)
         self.intron_reads = self.intron_reads.to(device)
         self.coverage = self.coverage.to(device)
         self.isoform_length_offset = self.isoform_length_offset.to(device)
+        self.exon_count_dispersion = self.exon_count_dispersion.to(device)
+        self.intron_count_dispersion = self.intron_count_dispersion.to(device)
         return self
 
 
@@ -82,6 +107,15 @@ class GlobalGeneData:
     coverage: torch.Tensor  # (num_samples, num_introns, num_bins)
     isoform_length_offset: torch.Tensor  # (num_samples, num_genes)
     gene_idx: torch.Tensor  # (num_introns,) int64 — maps intron index -> gene index
+    # As in GeneData: zero is the Poisson distribution, and so is leaving them out.
+    exon_count_dispersion: Optional[torch.Tensor] = None  # (num_genes,)
+    intron_count_dispersion: Optional[torch.Tensor] = None  # (num_introns,)
+
+    def __post_init__(self):
+        if self.exon_count_dispersion is None:
+            self.exon_count_dispersion = torch.zeros(len(self.gene_names), dtype=MODEL_DTYPE)
+        if self.intron_count_dispersion is None:
+            self.intron_count_dispersion = torch.zeros(len(self.intron_names), dtype=MODEL_DTYPE)
 
     def to(self, device):
         self.exon_reads = self.exon_reads.to(device)
@@ -89,6 +123,8 @@ class GlobalGeneData:
         self.coverage = self.coverage.to(device)
         self.isoform_length_offset = self.isoform_length_offset.to(device)
         self.gene_idx = self.gene_idx.to(device)
+        self.exon_count_dispersion = self.exon_count_dispersion.to(device)
+        self.intron_count_dispersion = self.intron_count_dispersion.to(device)
         return self
 
 
@@ -105,6 +141,8 @@ def concat_gene_data_list(gene_data_list: list[GeneData]) -> GlobalGeneData:
         coverage=torch.cat([g.coverage for g in gene_data_list], dim=1),
         isoform_length_offset=torch.stack([g.isoform_length_offset for g in gene_data_list], dim=1),
         gene_idx=gene_idx,
+        exon_count_dispersion=torch.stack([g.exon_count_dispersion for g in gene_data_list]),
+        intron_count_dispersion=torch.cat([g.intron_count_dispersion for g in gene_data_list]),
     )
 
 
@@ -177,13 +215,44 @@ def load_dataset_metadata(design_matrix_file: Path,
     return dataset_metadata
 
 
+def _load_count_dispersions(dispersions_file: Path, id_column: str) -> pd.Series:
+    """One dispersion per gene or per intron, indexed by `id_column`."""
+    dispersions = pd.read_csv(dispersions_file, sep='\t').set_index(id_column)['dispersion']
+    if dispersions.isna().any() or (dispersions < 0).any():
+        raise ValueError(f'{dispersions_file} holds missing or negative dispersions.')
+    return dispersions
+
+
 def load_gene_data_list(modeled_genes_file: Path,
                         modeled_introns_file: Path,
                         exon_counts_file: Path,
                         intron_counts_file: Path,
                         isoform_length_factors_file: Path,
                         coverage_folder: Path,
-                        sample_names: list[str]) -> list[GeneData]:
+                        sample_names: list[str],
+                        count_distribution: CountDistribution = CountDistribution.POISSON,
+                        exon_count_dispersions_file: Optional[Path] = None,
+                        intron_count_dispersions_file: Optional[Path] = None) -> list[GeneData]:
+    """
+    Read counts, coverage and offsets of every modeled gene.
+
+    Under the negative binomial the two dispersion tables are required, and have to cover every
+    modeled gene and every modeled intron. Under Poisson they are refused rather than ignored, so
+    that a run cannot be labelled as one distribution while being fitted under the other.
+    """
+    count_distribution = CountDistribution(count_distribution)
+    dispersion_files = (exon_count_dispersions_file, intron_count_dispersions_file)
+    if count_distribution == CountDistribution.NEGATIVE_BINOMIAL:
+        if any(file is None for file in dispersion_files):
+            raise ValueError('The negative binomial count distribution needs both the exon and '
+                             'the intron count dispersions.')
+        exon_count_dispersions = _load_count_dispersions(exon_count_dispersions_file, 'gene_id')
+        intron_count_dispersions = _load_count_dispersions(intron_count_dispersions_file,
+                                                           'intron_id')
+    elif any(file is not None for file in dispersion_files):
+        raise ValueError('Count dispersions were given, but the Poisson count distribution has '
+                         'none.')
+
     modeled_genes_df = pd.read_csv(modeled_genes_file, sep='\t')
     exon_counts_df = pd.read_csv(exon_counts_file, sep='\t').set_index('gene_id')
     exon_counts_df = exon_counts_df[sample_names]
@@ -240,12 +309,26 @@ def load_gene_data_list(modeled_genes_file: Path,
                                               dtype=MODEL_DTYPE)
         isoform_length_offset = torch.log(isoform_length_factors)
 
+        # Left out under Poisson, where `GeneData` fills in zeros.
+        exon_count_dispersion = None
+        intron_count_dispersion = None
+        if count_distribution == CountDistribution.NEGATIVE_BINOMIAL:
+            if (gene_id not in exon_count_dispersions.index
+                    or not set(gene_intron_names) <= set(intron_count_dispersions.index)):
+                raise ValueError(f'Gene {gene_id} or some of its introns have no count dispersion.')
+            exon_count_dispersion = torch.tensor(exon_count_dispersions.loc[gene_id],
+                                                 dtype=MODEL_DTYPE)
+            intron_count_dispersion = torch.tensor(
+                intron_count_dispersions.loc[gene_intron_names].values, dtype=MODEL_DTYPE)
+
         gene_data = GeneData(gene_name=gene_id,
                              intron_names=gene_intron_names,
                              exon_reads=exon_reads,
                              intron_reads=intron_reads,
                              coverage=coverage,
-                             isoform_length_offset=isoform_length_offset)
+                             isoform_length_offset=isoform_length_offset,
+                             exon_count_dispersion=exon_count_dispersion,
+                             intron_count_dispersion=intron_count_dispersion)
         gene_data_list.append(gene_data)
 
     return gene_data_list
