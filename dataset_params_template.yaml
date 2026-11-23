@@ -41,6 +41,14 @@ fit_intron_specific_intron_coverage_model: false
 # written to a separate *_joint_likelihood folder.
 use_plug_in_coverage: true
 
+# Distribution of the exon and intron read counts in the RNA kinetics models. The negative
+# binomial accounts for the variability between replicates, with one dispersion per gene and per
+# intron that is estimated by DESeq2 under your design formula and then held fixed. Under Poisson
+# the standard errors and p-values only reflect the sampling of reads, which makes them too
+# optimistic for replicates of a real experiment. A design without replicates leaves nothing to
+# estimate the dispersions from, in which case the pipeline fits Poisson and says so.
+count_distribution: "negative_binomial" # One of ['negative_binomial', 'poisson'].
+
 contrasts: # List of contrasts for likelihood ratio tests.
   - variable: "your_categorical_variable_to_test" # For categorical variables, please specify groups (levels) that you want to compare
     group_1: "your_intervention_group"

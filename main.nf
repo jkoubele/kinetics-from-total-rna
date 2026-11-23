@@ -114,7 +114,8 @@ workflow {
             as_boolean(params.fit_global_intron_coverage_model),
             as_boolean(params.fit_gene_specific_intron_coverage_model),
             as_boolean(params.fit_intron_specific_intron_coverage_model),
-            as_boolean(params.use_plug_in_coverage)
+            as_boolean(params.use_plug_in_coverage),
+            params.count_distribution
         )
     }
 }

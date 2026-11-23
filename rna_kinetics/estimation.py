@@ -399,9 +399,20 @@ def train_model(
         evaluate_loss: Callable[[], torch.Tensor],
         max_epochs=200,
         max_patience=3,
-        loss_change_tolerance=1e-6,
+        loss_change_tolerance=1e-5,
         verbose: bool = False,
 ) -> tuple[nn.Module, TrainingResults]:
+    """
+    Train a model in epochs of `optimizer.step(closure)`, and return it at its lowest loss.
+
+    The model is restored to the best state seen, including the starting one, so training never
+    returns a model worse than it was given. A non-finite loss stops training and is reported as
+    `training_diverged`, with the model restored to its last finite best.
+
+    Training stops once the loss has changed by less than `loss_change_tolerance` (in nats) for
+    `max_patience` epochs in a row. The change is absolute rather than relative because the
+    losses keep arbitrary constant terms.
+    """
     previous_loss = None
     patience_counter = 0
 
@@ -432,8 +443,7 @@ def train_model(
             best_state_dict = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
         if previous_loss is not None:
-            relative_loss_change = abs(loss - previous_loss) / (abs(previous_loss) + 1e-10)
-            if relative_loss_change < loss_change_tolerance:
+            if abs(loss - previous_loss) < loss_change_tolerance:
                 patience_counter += 1
                 if patience_counter >= max_patience:
                     converged_within_max_epochs = True
@@ -681,6 +691,8 @@ def _make_rna_kinetics_closures(
             predicted_reads_exon=predicted_reads_exon,
             predicted_reads_intron=predicted_reads_intron,
             predicted_pi=predicted_pi,
+            exon_count_dispersion=gene_data.exon_count_dispersion,
+            intron_count_dispersion=gene_data.intron_count_dispersion,
         )
         if prior_precision is not None:
             loss += get_prior_penalty(model, prior_precision)
@@ -1344,8 +1356,8 @@ def add_wald_test_results(df_param: pd.DataFrame,
     df_param['identifiable'] = df_param.index.isin(identifiable_indices)
     df_param.loc[identifiable_indices, 'SE'] = standard_errors
     df_param.loc[identifiable_indices, 'z_score'] = df_param.loc[identifiable_indices, 'value'] / standard_errors
-    df_param.loc[identifiable_indices, 'p_value_wald'] = 2 * (
-            1 - stats.norm.cdf(np.abs(df_param.loc[identifiable_indices, 'z_score'])))
+    df_param.loc[identifiable_indices, 'p_value_wald'] = 2 * stats.norm.sf(
+        np.abs(df_param.loc[identifiable_indices, 'z_score']))
 
     return df_param
 
@@ -1471,7 +1483,7 @@ def get_contrast_wald_results(parameter_covariance: Optional[ParameterCovariance
     z_score = lfc / standard_error if standard_error > 0 else np.nan
     return {'lfc_se': standard_error,
             'z_score': z_score,
-            'p_value_wald': 2 * (1 - stats.norm.cdf(np.abs(z_score))),
+            'p_value_wald': 2 * stats.norm.sf(np.abs(z_score)),
             'lfc_identifiable': True}
 
 
@@ -1798,7 +1810,9 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
                                 intron_coverage=gene_data.coverage,
                                 predicted_reads_exon=predicted_reads_exon,
                                 predicted_reads_intron=predicted_reads_intron,
-                                predicted_pi=predicted_pi)
+                                predicted_pi=predicted_pi,
+                                exon_count_dispersion=gene_data.exon_count_dispersion,
+                                intron_count_dispersion=gene_data.intron_count_dispersion)
 
     fisher_information_matrix = get_fisher_information_matrix(model_full, rna_kinetics_loss_by_params)
     if plug_in_coverage is None:
@@ -1869,8 +1883,8 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
         test_result['loss_reduced_model'] = results_reduced.final_loss
         test_result['chi2_test_statistics'] = 2 * (results_reduced.final_loss
                                                    - results_full.final_loss)
-        test_result['p_value'] = 1 - stats.chi2.cdf(test_result['chi2_test_statistics'],
-                                                    df=test_result['lrt_df'])
+        test_result['p_value'] = stats.chi2.sf(test_result['chi2_test_statistics'],
+                                                df=test_result['lrt_df'])
         test_result['num_full_model_restarts'] = fits.num_full_model_restarts
         test_results_list.append(test_result)
 
@@ -2116,7 +2130,7 @@ def get_intron_coverage_model_results(
         test_result['loss_full_model'] = results_full.final_loss
         test_result['loss_reduced_model'] = results_reduced.final_loss
         test_result['chi2_test_statistics'] = chi2_stat
-        test_result['p_value'] = 1 - stats.chi2.cdf(chi2_stat, df=lrt_row['lrt_df'])
+        test_result['p_value'] = stats.chi2.sf(chi2_stat, df=lrt_row['lrt_df'])
         test_result['training_diverged_reduced_model'] = results_reduced.training_diverged
         test_result['training_converged_within_max_epochs_reduced_model'] = results_reduced.converged_within_max_epochs
         test_result['num_epochs_reduced_model'] = results_reduced.num_epochs
@@ -2159,6 +2173,8 @@ def _make_global_rna_kinetics_closures(
             predicted_reads_exon=predicted_reads_exon,
             predicted_reads_intron=predicted_reads_intron,
             predicted_pi=predicted_pi,
+            exon_count_dispersion=global_gene_data.exon_count_dispersion,
+            intron_count_dispersion=global_gene_data.intron_count_dispersion,
         )
 
     return _make_closures(optimizer, _compute_loss)
@@ -2167,6 +2183,12 @@ def _make_global_rna_kinetics_closures(
 # The global models train in two passes and can need many more epochs than a per-gene fit, which
 # `train_model` caps at its own, lower default.
 MAX_EPOCHS_GLOBAL_MODEL = 1000
+# LBFGS converges slowly on the global models, which hold one intercept per gene or intron, and
+# would keep improving the loss by small amounts for far longer than the reported LFCs and LRT
+# statistics take to settle. The per-gene fits converge on LBFGS's own criterion and keep the
+# tighter default of `train_model`.
+LOSS_CHANGE_TOLERANCE_GLOBAL_MODEL = 1e-1
+MAX_PATIENCE_GLOBAL_MODEL = 5
 
 
 def _train_global_model(
@@ -2201,7 +2223,10 @@ def _train_global_model(
         )
         closure_pass_1, eval_pass_1 = make_closures(optimizer_pass_1)
         model, _ = train_model(model, optimizer_pass_1, closure_pass_1, eval_pass_1,
-                               max_epochs=MAX_EPOCHS_GLOBAL_MODEL, verbose=verbose)
+                               max_epochs=MAX_EPOCHS_GLOBAL_MODEL,
+                               max_patience=MAX_PATIENCE_GLOBAL_MODEL,
+                               loss_change_tolerance=LOSS_CHANGE_TOLERANCE_GLOBAL_MODEL,
+                               verbose=verbose)
 
     # Pass 2: unfreeze all, refine every parameter from the warm start
     if verbose:
@@ -2212,6 +2237,8 @@ def _train_global_model(
     closure_pass_2, eval_pass_2 = make_closures(optimizer_pass_2)
     model, training_results = train_model(model, optimizer_pass_2, closure_pass_2, eval_pass_2,
                                           max_epochs=MAX_EPOCHS_GLOBAL_MODEL,
+                                          max_patience=MAX_PATIENCE_GLOBAL_MODEL,
+                                          loss_change_tolerance=LOSS_CHANGE_TOLERANCE_GLOBAL_MODEL,
                                           verbose=verbose)
     return model, training_results
 
@@ -2339,7 +2366,7 @@ def get_global_rna_kinetics_model_results(
         test_result['loss_full_model'] = training_results.final_loss
         test_result['loss_reduced_model'] = results_reduced.final_loss
         test_result['chi2_test_statistics'] = chi2_stat
-        test_result['p_value'] = 1 - stats.chi2.cdf(chi2_stat, df=lrt_row['lrt_df'])
+        test_result['p_value'] = stats.chi2.sf(chi2_stat, df=lrt_row['lrt_df'])
         test_result['training_diverged_reduced_model'] = results_reduced.training_diverged
         test_result[
             'training_converged_within_max_epochs_reduced_model'] = results_reduced.converged_within_max_epochs
