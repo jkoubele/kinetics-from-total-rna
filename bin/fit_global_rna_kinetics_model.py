@@ -51,11 +51,6 @@ if __name__ == "__main__":
                              'left out. Writes its rate ratio LFCs instead of the usual outputs. '
                              'Under the plug-in, the coverage fit given has to leave out the same '
                              'sample. The count dispersions are those of all samples.')
-    parser.add_argument('--hot_start_state_dict',
-                        type=Path,
-                        default=None,
-                        help='Model state to initialize the full fit from; a jackknife replicate '
-                             'is initialized from the fit to all samples.')
     args = parser.parse_args()
 
     args.output_folder.mkdir(exist_ok=True, parents=True)
@@ -72,6 +67,12 @@ if __name__ == "__main__":
                 != JackknifeStatus.OK):
             raise ValueError('Leaving out a sample makes this design rank deficient, so it has no '
                              'jackknife replicates.')
+        # The replicate is fitted from scratch rather than warm-started from the fit to all
+        # samples. Removing a sample changes the data and, under the plug-in, the frozen coverage
+        # values, so a parameter on a flat region of the loss in the fit to all samples (the
+        # unspliced intercept of an intron whose pi is 1 there) can become informative in the
+        # replicate while its gradient is still zero, leaving a warm-started replicate away from
+        # its optimum.
         dataset_metadata = dataset_metadata.without_sample(args.jackknife_drop_sample)
 
     gene_data_list = load_gene_data_list(
@@ -96,15 +97,10 @@ if __name__ == "__main__":
         plug_in_coverage_fits = torch.load(args.plug_in_coverage_fits,
                                            weights_only=False).fits
 
-    hot_start_state_dict = None
-    if args.hot_start_state_dict is not None:
-        hot_start_state_dict = torch.load(args.hot_start_state_dict, weights_only=False)
-
     results = get_global_rna_kinetics_model_results(
         global_gene_data=global_gene_data,
         dataset_metadata=dataset_metadata,
         plug_in_coverage_fits=plug_in_coverage_fits,
-        hot_start_state_dict=hot_start_state_dict,
         verbose=True,
     )
 
@@ -117,5 +113,3 @@ if __name__ == "__main__":
     results.model_parameters.to_csv(args.output_folder / 'model_parameters.tsv', sep='\t',
                                     index=False)
     results.test_results.to_csv(args.output_folder / 'test_results.tsv', sep='\t', index=False)
-    # The initialization of the jackknife replicates.
-    torch.save(results.state_dict_full_model, args.output_folder / 'model_state_dict.pt')

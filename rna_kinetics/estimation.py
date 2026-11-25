@@ -1985,7 +1985,6 @@ def get_intron_coverage_model_results(
         intron_names: list[str],
         is_global_model: bool = False,
         intron_specific_lfc: bool = False,
-        hot_start_state_dict: Optional[StateDict] = None,
         device: str = 'cpu',
         verbose: bool = False,
 ) -> ModelFitResults:
@@ -2001,10 +2000,6 @@ def get_intron_coverage_model_results(
     `intron_specific_lfc` says this call is one intron's fit, which is what decides whether the
     LFC is reported under that intron's name. It is declared rather than read off the length of
     `intron_names`, so that a gene with one intron is still a gene-wide fit.
-
-    `hot_start_state_dict` initializes the full fit from an earlier fit of the same introns
-    instead of from the grid search over pi. Jackknife replicates are initialized from the fit to
-    all samples.
     """
     coverage = coverage.to(device)
     dataset_metadata = dataset_metadata.to(device)
@@ -2042,10 +2037,7 @@ def get_intron_coverage_model_results(
 
     def fit_full_from_scratch() -> tuple[IntronCoverageModel, TrainingResults]:
         model = build_full_model()
-        if hot_start_state_dict is None:
-            model.initialize_parameters(coverage)
-        else:
-            model.load_state_dict(hot_start_state_dict)
+        model.initialize_parameters(coverage)
         return fit(model, dataset_metadata.design_matrix, 'Intron coverage | full model')
 
     def fit_reduced(model_full: IntronCoverageModel,
@@ -2253,7 +2245,6 @@ def get_global_rna_kinetics_model_results(
         global_gene_data: GlobalGeneData,
         dataset_metadata: DatasetMetadata,
         plug_in_coverage_fits: Optional[list[PlugInCoverageFit]] = None,
-        hot_start_state_dict: Optional[StateDict] = None,
         device: str = 'cpu',
         verbose: bool = False,
 ) -> ModelFitResults:
@@ -2268,11 +2259,6 @@ def get_global_rna_kinetics_model_results(
     `ratio_lfcs` contains all three ratios, including a plugged-in one, and no standard errors,
     since this model computes no Fisher information. Jackknife replicates report it, and the
     contrasts are computed from it afterwards.
-
-    `hot_start_state_dict` initializes the full fit from an earlier fit of the same genes and
-    introns. Jackknife replicates are initialized from the fit to all samples. Under the plug-in,
-    the state dict also carries the coverage values that fit froze; they are replaced by those of
-    `plug_in_coverage_fits` after loading.
     """
     global_gene_data = global_gene_data.to(device)
     dataset_metadata = dataset_metadata.to(device)
@@ -2327,13 +2313,8 @@ def get_global_rna_kinetics_model_results(
 
     def fit_full_from_scratch() -> tuple[GlobalRNAKineticsModel, TrainingResults]:
         model = build_model(None)
-        if hot_start_state_dict is None:
-            model.initialize_parameters(global_gene_data, dataset_metadata.library_sizes,
-                                        dataset_metadata.design_matrix)
-        else:
-            model.load_state_dict(hot_start_state_dict)
-            if plug_in_coverage is not None:
-                model.set_plug_in_coverage(plug_in_coverage)
+        model.initialize_parameters(global_gene_data, dataset_metadata.library_sizes,
+                                   dataset_metadata.design_matrix)
         return fit(model, None, 'Global RNA kinetics | full model')
 
     def fit_reduced(model_full: GlobalRNAKineticsModel,

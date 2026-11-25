@@ -251,9 +251,7 @@ process FitIntronSpecificIntronCoverageModel {
 }
 
 process FitGlobalIntronCoverageModel {
-    // The state dict is only the starting point of the jackknife replicates.
-    publishDir "${params.outdir}/modeling/${params.model_run_id}/global_intron_coverage_model", mode: 'copy',
-        saveAs: { filename -> filename == 'model_state_dict.pt' ? null : filename }
+    publishDir "${params.outdir}/modeling/${params.model_run_id}/global_intron_coverage_model", mode: 'copy'
 
     input:
     tuple(
@@ -269,7 +267,6 @@ process FitGlobalIntronCoverageModel {
     path("model_parameters.tsv"), emit: model_parameters
     path("test_results_raw.tsv"), emit: test_results
     path("plug_in_coverage_fits.pt"), emit: plug_in_coverage_fits
-    path("model_state_dict.pt"), emit: model_state_dict
 
     script:
     """
@@ -286,8 +283,8 @@ process FitGlobalIntronCoverageModel {
 }
 
 process FitGlobalIntronCoverageModelJackknife {
-    // One jackknife replicate: the full model with one sample left out, started from the fit to
-    // all samples. Not published; AddJackknifeResults publishes the replicates together.
+    // One jackknife replicate: the full model with one sample removed, fitted from scratch. Not
+    // published; AddJackknifeResults publishes the replicates together.
     input:
     tuple(
         path(modeled_introns),
@@ -296,7 +293,6 @@ process FitGlobalIntronCoverageModelJackknife {
         path(reduced_matrices_folder),
         path(library_size_factors),
         path(coverage_parquet_files),
-        path(hot_start_state_dict),
         val(dropped_sample)
     )
 
@@ -314,15 +310,13 @@ process FitGlobalIntronCoverageModelJackknife {
     --lrt_metadata ${lrt_metadata} \
     --reduced_matrices_folder ${reduced_matrices_folder} \
     --coverage_data_folder . \
-    --hot_start_state_dict $hot_start_state_dict \
     --jackknife_drop_sample '${dropped_sample}'
     """
 }
 
 process FitGlobalRNAKineticsModel {
-    // The state dict is only the initialization of the jackknife replicates.
     publishDir { "${params.outdir}/modeling/${params.model_run_id}/${model_type_subfolder}" },
-     mode: 'copy', saveAs: { filename -> filename == 'model_state_dict.pt' ? null : filename }
+     mode: 'copy'
 
     input:
     tuple(
@@ -346,7 +340,6 @@ process FitGlobalRNAKineticsModel {
     output:
     path("model_parameters.tsv"), emit: model_parameters
     path("test_results_raw.tsv"), emit: test_results
-    path("model_state_dict.pt"), emit: model_state_dict
 
     script:
     // Empty where the joint likelihood is being fitted instead, which stages no file and
@@ -377,9 +370,9 @@ process FitGlobalRNAKineticsModel {
 }
 
 process FitGlobalRNAKineticsModelJackknife {
-    // One jackknife replicate: the full model with one sample removed, initialized from the fit
-    // to all samples. Under the plug-in it freezes the coverage replicate that removed the same
-    // sample. Not published; AddJackknifeResults publishes the replicates together.
+    // One jackknife replicate: the full model with one sample removed, fitted from scratch. Under
+    // the plug-in it freezes the coverage replicate that removed the same sample. Not published;
+    // AddJackknifeResults publishes the replicates together.
     input:
     tuple(
         path(modeled_genes),
@@ -395,7 +388,6 @@ process FitGlobalRNAKineticsModelJackknife {
         path(plug_in_coverage_fits),
         path(exon_count_dispersions),
         path(intron_count_dispersions),
-        path(hot_start_state_dict),
         val(count_distribution),
         val(dropped_sample)
     )
@@ -425,7 +417,6 @@ process FitGlobalRNAKineticsModelJackknife {
     --count_distribution ${count_distribution} \
     ${dispersions_argument} \
     ${plug_in_argument} \
-    --hot_start_state_dict $hot_start_state_dict \
     --jackknife_drop_sample '${dropped_sample}'
     """
 }
@@ -1055,9 +1046,7 @@ workflow global_intron_coverage_model_subworkflow {
         def jackknife_coverage_fits = channel.empty()
         if (jackknife_global_models) {
             def jackknife_output = FitGlobalIntronCoverageModelJackknife(
-                fit_input
-                    .combine(fit_output.model_state_dict)
-                    .combine(jackknife_samples)
+                fit_input.combine(jackknife_samples)
             )
             jackknife_coverage_fits = jackknife_output.plug_in_coverage_fits
             // The replicates are gathered into one list. Where the design has no jackknife
@@ -1157,13 +1146,12 @@ workflow global_rna_kinetics_model_subworkflow {
                 (count_distribution == 'negative_binomial'
                     ? jackknife_input.combine(count_dispersions)
                     : jackknife_input.map { replicate_input -> replicate_input + [[], []] })
-                    .combine(fit_output.model_state_dict)
-                    // [sample, coverage fit, fit inputs..., two dispersion tables, state dict]
-                    // into the order the process declares.
+                    // [sample, coverage fit, fit inputs..., two dispersion tables] into the
+                    // order the process declares.
                     .map { replicate_input ->
-                        def fit_inputs = replicate_input[2..-4]
-                        def dispersions_and_state = replicate_input[-3..-1]
-                        fit_inputs + [replicate_input[1]] + dispersions_and_state + [count_distribution, replicate_input[0]]
+                        def fit_inputs = replicate_input[2..-3]
+                        def dispersions = replicate_input[-2..-1]
+                        fit_inputs + [replicate_input[1]] + dispersions + [count_distribution, replicate_input[0]]
                     }
             )
             // Gathered as in the coverage subworkflow.
