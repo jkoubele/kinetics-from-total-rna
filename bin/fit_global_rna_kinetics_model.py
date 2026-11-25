@@ -11,6 +11,16 @@ from rna_kinetics.estimation import (get_global_rna_kinetics_model_results,
                                      get_jackknife_design_status, get_jackknife_ratio_lfc_df,
                                      JackknifeStatus)
 
+
+def parse_bool_in_argparse(argument: str) -> bool:
+    if argument.lower() == 'true':
+        return True
+    elif argument.lower() == 'false':
+        return False
+    else:
+        raise argparse.ArgumentTypeError("Boolean value expected. Use either 'true' or 'false'.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--modeled_genes', type=Path, required=True)
@@ -24,6 +34,11 @@ if __name__ == "__main__":
     parser.add_argument('--lrt_metadata', type=Path, required=True)
     parser.add_argument('--reduced_matrices_folder', type=Path, required=True)
     parser.add_argument('--output_folder', type=Path, default=Path('.'))
+    parser.add_argument('--run_lrt',
+                        type=parse_bool_in_argparse,
+                        default=True,
+                        help='Whether to fit the reduced models of the likelihood ratio tests '
+                             '(true or false). A jackknife replicate fits none either way.')
     parser.add_argument('--plug_in_coverage_fits',
                         type=Path,
                         default=None,
@@ -101,6 +116,7 @@ if __name__ == "__main__":
         global_gene_data=global_gene_data,
         dataset_metadata=dataset_metadata,
         plug_in_coverage_fits=plug_in_coverage_fits,
+        run_lrt=args.run_lrt,
         verbose=True,
     )
 

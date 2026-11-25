@@ -56,6 +56,19 @@ count_distribution: "negative_binomial" # One of ['negative_binomial', 'poisson'
 # each global model per sample, so it can take long for datasets with many samples.
 jackknife_global_models: true
 
+# Likelihood-ratio tests of the per-gene and per-intron RNA kinetics models, added as an extra
+# column (p_value_lrt) next to the Wald test that the volcano plots use. They treat the estimate
+# taken over from the intron coverage model as known, so their p-values are too small. They need
+# one extra fit per tested ratio and contrast, and per intron in the per-intron model. The
+# reported effect sizes may then not be bit-identical to a run without them. Only used together
+# with use_plug_in_coverage; the joint likelihood always runs them.
+run_plug_in_lrt: false
+
+# The same for the global RNA kinetics model, where the likelihood-ratio test is kept for
+# comparison with the jackknife, and is shown in the plots where the jackknife is not available.
+# Switching it off may likewise make the effect sizes not bit-identical.
+run_global_plug_in_lrt: true
+
 contrasts: # List of contrasts for likelihood ratio tests.
   - variable: "your_categorical_variable_to_test" # For categorical variables, please specify groups (levels) that you want to compare
     group_1: "your_intervention_group"

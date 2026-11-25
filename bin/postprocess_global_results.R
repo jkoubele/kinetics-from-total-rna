@@ -39,7 +39,8 @@ if (!has_jackknife) {
 
 # The plots show the jackknife p-value wherever there is one, and the likelihood ratio test's
 # otherwise. The latter treats genes as independent replicates and so overstates the evidence for
-# a global effect, which is why the caption says which one a plot shows.
+# a global effect, which is why the caption says which one a plot shows. A row can have neither,
+# where the jackknife was not available and the likelihood ratio test was switched off.
 test_results <- test_results |>
   mutate(
     l2fc       = lfc / log(2),
@@ -50,14 +51,19 @@ test_results <- test_results |>
       variable
     ),
     p_value_plotted = coalesce(p_value_jackknife, p_value_lrt),
-    p_value_source  = if_else(is.na(p_value_jackknife), "lrt", "jackknife"),
+    p_value_source  = case_when(
+      !is.na(p_value_jackknife) ~ "jackknife",
+      !is.na(p_value_lrt)       ~ "lrt",
+      TRUE                      ~ "none"
+    ),
     sig_label = case_when(
+      is.na(p_value_plotted)  ~ "not tested",
       p_value_plotted < 0.001 ~ "***",
       p_value_plotted < 0.01  ~ "**",
       p_value_plotted < 0.05  ~ "*",
       TRUE                    ~ "n.s."
     ),
-    significant = p_value_plotted < 0.05,
+    significant = coalesce(p_value_plotted < 0.05, FALSE),
     # 95% confidence interval from the jackknife, on the log2 scale.
     ci_half_width = qt(0.975, df_jackknife) * l2fc_se_jackknife
   )
@@ -95,16 +101,24 @@ sig_caption <- "* p<0.05   ** p<0.01   *** p<0.001"
 
 get_p_value_caption <- function(p_value_sources) {
   sources <- unique(p_value_sources)
-  if (identical(sources, "jackknife")) {
-    return("p-values and 95% intervals: delete-one-sample jackknife")
-  }
+  tested_sources <- setdiff(sources, "none")
   lrt_caption <- paste0("likelihood ratio test, which treats genes as independent replicates\n",
                         "and so overstates the evidence for a global effect")
-  if (identical(sources, "lrt")) {
-    return(paste("p-values:", lrt_caption))
+  caption <- if (identical(tested_sources, "jackknife")) {
+    "p-values and 95% intervals: delete-one-sample jackknife"
+  } else if (identical(tested_sources, "lrt")) {
+    paste("p-values:", lrt_caption)
+  } else if (length(tested_sources) == 2) {
+    paste0("p-values and 95% intervals: delete-one-sample jackknife where shown;\n",
+           "elsewhere ", lrt_caption)
+  } else {
+    NULL
   }
-  paste0("p-values and 95% intervals: delete-one-sample jackknife where shown;\n",
-         "elsewhere ", lrt_caption)
+  if ("none" %in% sources) {
+    caption <- c(caption, paste("not tested: no jackknife available, and the likelihood ratio",
+                                "test was switched off"))
+  }
+  paste(caption, collapse = "\n")
 }
 
 make_global_plot <- function(df, subtitle) {

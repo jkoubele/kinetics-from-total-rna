@@ -66,6 +66,12 @@ if __name__ == "__main__":
                         type=parse_bool_in_argparse,
                         required=True,
                         help='Whether to use intron-specific LFC (true or false).')
+    parser.add_argument('--run_lrt',
+                        type=parse_bool_in_argparse,
+                        default=True,
+                        help='Whether to fit the reduced models of the likelihood ratio tests '
+                             '(true or false). Without them the test results carry the Wald '
+                             'test only.')
     parser.add_argument('--plug_in_coverage_fits',
                         type=Path,
                         default=None,
@@ -125,7 +131,8 @@ if __name__ == "__main__":
     result_list = [get_rna_kinetics_model_results(gene_data=gene_data,
                                                   dataset_metadata=dataset_metadata,
                                                   intron_specific_lfc=args.intron_specific_lfc,
-                                                  plug_in_coverage_fits=plug_in_coverage_fits)
+                                                  plug_in_coverage_fits=plug_in_coverage_fits,
+                                                  run_lrt=args.run_lrt)
                    for gene_data in tqdm(gene_data_list)]
 
     state_dicts_list: list[StateDict] = [result.state_dict_full_model for result in result_list]
