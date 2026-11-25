@@ -49,6 +49,13 @@ use_plug_in_coverage: true
 # estimate the dispersions from, in which case the pipeline fits Poisson and says so.
 count_distribution: "negative_binomial" # One of ['negative_binomial', 'poisson'].
 
+# Refit each global model once per sample, leaving that sample out, to get standard errors and
+# p-values (p_value_jackknife) from the variation between replicates. The likelihood-ratio test of
+# a global model treats the genes as independent replicates, which overstates the evidence for a
+# global effect by orders of magnitude. Needs at least two samples per group. Adds one fit of
+# each global model per sample, so it can take long for datasets with many samples.
+jackknife_global_models: true
+
 contrasts: # List of contrasts for likelihood ratio tests.
   - variable: "your_categorical_variable_to_test" # For categorical variables, please specify groups (levels) that you want to compare
     group_1: "your_intervention_group"

@@ -53,6 +53,27 @@ class DatasetMetadata:
             self.reduced_matrices[name] = matrix.to(device)
         return self
 
+    def without_sample(self, sample_name: str) -> 'DatasetMetadata':
+        """
+        The dataset with one sample removed and without likelihood ratio tests.
+
+        Used for a jackknife replicate, which fits the full model only. The reduced matrices are
+        dropped rather than subset, because removing a sample can break their nesting in the full
+        design.
+        """
+        if sample_name not in self.sample_names:
+            raise ValueError(f'Sample {sample_name} is not in the design.')
+        kept = torch.tensor([index for index, name in enumerate(self.sample_names)
+                             if name != sample_name])
+        return DatasetMetadata(design_matrix=self.design_matrix[kept],
+                               library_sizes=self.library_sizes[kept],
+                               log_library_sizes=self.log_library_sizes[kept],
+                               feature_names=list(self.feature_names),
+                               sample_names=[name for name in self.sample_names
+                                             if name != sample_name],
+                               lrt_metadata=self.lrt_metadata.iloc[0:0],
+                               reduced_matrices={})
+
 
 @dataclass
 class IntronData:

@@ -7,7 +7,9 @@ import torch
 
 from rna_kinetics.data import (CountDistribution, load_dataset_metadata, load_gene_data_list,
                                concat_gene_data_list)
-from rna_kinetics.estimation import get_global_rna_kinetics_model_results
+from rna_kinetics.estimation import (get_global_rna_kinetics_model_results,
+                                     get_jackknife_design_status, get_jackknife_ratio_lfc_df,
+                                     JackknifeStatus)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -43,6 +45,12 @@ if __name__ == "__main__":
                         type=Path,
                         default=None,
                         help='Path to the TSV file with one count dispersion per intron.')
+    parser.add_argument('--jackknife_drop_sample',
+                        default=None,
+                        help='Fit one jackknife replicate: the full model only, with this sample '
+                             'left out. Writes its rate ratio LFCs instead of the usual outputs. '
+                             'Under the plug-in, the coverage fit given has to leave out the same '
+                             'sample. The count dispersions are those of all samples.')
     args = parser.parse_args()
 
     args.output_folder.mkdir(exist_ok=True, parents=True)
@@ -53,6 +61,19 @@ if __name__ == "__main__":
         lrt_metadata_file=args.lrt_metadata,
         reduced_matrices_folder=args.reduced_matrices_folder,
     )
+    if args.jackknife_drop_sample is not None:
+        # The workflow launches the replicates only for a design that passes this check.
+        if (get_jackknife_design_status(dataset_metadata.design_matrix.numpy())
+                != JackknifeStatus.OK):
+            raise ValueError('Leaving out a sample makes this design rank deficient, so it has no '
+                             'jackknife replicates.')
+        # The replicate is fitted from scratch rather than warm-started from the fit to all
+        # samples. Removing a sample changes the data and, under the plug-in, the frozen coverage
+        # values, so a parameter on a flat region of the loss in the fit to all samples (the
+        # unspliced intercept of an intron whose pi is 1 there) can become informative in the
+        # replicate while its gradient is still zero, leaving a warm-started replicate away from
+        # its optimum.
+        dataset_metadata = dataset_metadata.without_sample(args.jackknife_drop_sample)
 
     gene_data_list = load_gene_data_list(
         modeled_genes_file=args.modeled_genes,
@@ -69,7 +90,6 @@ if __name__ == "__main__":
 
     global_gene_data = concat_gene_data_list(gene_data_list)
 
-
     # `None` where no fits were given, which is what turns the plug-in off: the model then
     # estimates `lfc_elong_over_splice` and `intercept_pi_logit` from the joint likelihood.
     plug_in_coverage_fits = None
@@ -77,12 +97,19 @@ if __name__ == "__main__":
         plug_in_coverage_fits = torch.load(args.plug_in_coverage_fits,
                                            weights_only=False).fits
 
-    model_param_df, test_results_df = get_global_rna_kinetics_model_results(
+    results = get_global_rna_kinetics_model_results(
         global_gene_data=global_gene_data,
         dataset_metadata=dataset_metadata,
         plug_in_coverage_fits=plug_in_coverage_fits,
         verbose=True,
     )
 
-    model_param_df.to_csv(args.output_folder / 'model_parameters.tsv', sep='\t', index=False)
-    test_results_df.to_csv(args.output_folder / 'test_results.tsv', sep='\t', index=False)
+    if args.jackknife_drop_sample is not None:
+        get_jackknife_ratio_lfc_df(results, args.jackknife_drop_sample).to_csv(
+            args.output_folder / f'jackknife_ratio_lfcs_{args.jackknife_drop_sample}.tsv',
+            sep='\t', index=False)
+        raise SystemExit(0)
+
+    results.model_parameters.to_csv(args.output_folder / 'model_parameters.tsv', sep='\t',
+                                    index=False)
+    results.test_results.to_csv(args.output_folder / 'test_results.tsv', sep='\t', index=False)
