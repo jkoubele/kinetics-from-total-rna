@@ -39,7 +39,7 @@ test_results <- test_results |>
   ) |>
   rename(lfc_unregularized = lfc) |>
   select(gene_name, intron_name, rate_ratio, variable, group_1, group_2,
-         l2fc_unregularized, l2fc_regularized, l2fc_se, p_value, p_value_wald,
+         l2fc_unregularized, l2fc_regularized, l2fc_se, p_value_lrt, p_value_wald,
          chi2_test_statistics, test_id, test_type, everything())
 
 write_tsv(test_results, file.path(output_folder, "test_results.tsv"))
@@ -57,7 +57,7 @@ make_volcano_plots <- function(test_results, base_output_subfolder, lfc_col, lfc
       plot_test_results <- test_results |>
         filter(rate_ratio == plot_rate_ratio, test_id == plot_test_id) |>
         mutate(
-          p_value_clipped = pmax(p_value, min_p_value),
+          p_value_clipped = pmax(p_value_lrt, min_p_value),
           fdr             = p.adjust(p_value_clipped, method = "fdr"),
           l2fc_plot       = .data[[lfc_col]],
           category        = case_when(

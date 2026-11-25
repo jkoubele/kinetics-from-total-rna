@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Callable, Iterator, NamedTuple, Optional, OrderedDict, Sequence
 
 import numpy as np
@@ -24,7 +25,7 @@ StateDict = OrderedDict[str, torch.Tensor]
 @dataclass
 class TrainingResults:
     final_loss: float
-    converged_within_max_epochs: bool
+    converged: bool
     num_epochs: int
     losses: list[float]
     training_diverged: bool
@@ -423,7 +424,7 @@ def train_model(
     best_loss = initial_loss if np.isfinite(initial_loss) else np.inf
     best_state_dict = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
-    converged_within_max_epochs = False
+    converged = False
     training_diverged = False
 
     losses: list[float] = []
@@ -446,7 +447,7 @@ def train_model(
             if abs(loss - previous_loss) < loss_change_tolerance:
                 patience_counter += 1
                 if patience_counter >= max_patience:
-                    converged_within_max_epochs = True
+                    converged = True
                     break
             else:
                 patience_counter = 0
@@ -459,7 +460,7 @@ def train_model(
     # last loss is non-finite while the returned parameters are the finite best.
     training_results = TrainingResults(
         final_loss=best_loss,
-        converged_within_max_epochs=converged_within_max_epochs,
+        converged=converged,
         num_epochs=epoch + 1,
         losses=losses,
         training_diverged=training_diverged,
@@ -1793,8 +1794,7 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
     model_param_df['gene_name'] = gene_data.gene_name
     model_param_df['loss_full_model'] = results_full.final_loss
     model_param_df['training_diverged_full_model'] = results_full.training_diverged
-    model_param_df[
-        'training_converged_within_max_epochs_full_model'] = results_full.converged_within_max_epochs
+    model_param_df['training_converged_full_model'] = results_full.converged
     model_param_df['num_epochs_full_model'] = results_full.num_epochs
 
     # Wald test
@@ -1863,8 +1863,7 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
         test_result['gene_name'] = gene_data.gene_name
         test_result['intron_name'] = lrt_specification.tested_intron
         test_result['training_diverged_reduced_model'] = results_reduced.training_diverged
-        test_result[
-            'training_converged_within_max_epochs_reduced_model'] = results_reduced.converged_within_max_epochs
+        test_result['training_converged_reduced_model'] = results_reduced.converged
         test_result['num_epochs_reduced_model'] = results_reduced.num_epochs
         test_result['lfc'] = (
                 get_lfc_of_column(lfc_of_tested_ratio, feature_names,
@@ -1883,8 +1882,8 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
         test_result['loss_reduced_model'] = results_reduced.final_loss
         test_result['chi2_test_statistics'] = 2 * (results_reduced.final_loss
                                                    - results_full.final_loss)
-        test_result['p_value'] = stats.chi2.sf(test_result['chi2_test_statistics'],
-                                                df=test_result['lrt_df'])
+        test_result['p_value_lrt'] = stats.chi2.sf(test_result['chi2_test_statistics'],
+                                                    df=test_result['lrt_df'])
         test_result['num_full_model_restarts'] = fits.num_full_model_restarts
         test_results_list.append(test_result)
 
@@ -1966,8 +1965,7 @@ def get_regularized_rna_kinetics_model_results(gene_data: GeneData,
     model_param_df['gene_name'] = gene_data.gene_name
     model_param_df['loss_regularized_model'] = training_results_regularized.final_loss
     model_param_df['training_diverged_regularized_model'] = training_results_regularized.training_diverged
-    model_param_df[
-        'training_converged_within_max_epochs_regularized_model'] = training_results_regularized.converged_within_max_epochs
+    model_param_df['training_converged_regularized_model'] = training_results_regularized.converged
 
     ratio_lfc_df = get_ratio_lfc_df(
         model_regularized, parameter_covariance=None, with_standard_errors=False,
@@ -1987,6 +1985,7 @@ def get_intron_coverage_model_results(
         intron_names: list[str],
         is_global_model: bool = False,
         intron_specific_lfc: bool = False,
+        hot_start_state_dict: Optional[StateDict] = None,
         device: str = 'cpu',
         verbose: bool = False,
 ) -> ModelFitResults:
@@ -2002,6 +2001,10 @@ def get_intron_coverage_model_results(
     `intron_specific_lfc` says this call is one intron's fit, which is what decides whether the
     LFC is reported under that intron's name. It is declared rather than read off the length of
     `intron_names`, so that a gene with one intron is still a gene-wide fit.
+
+    `hot_start_state_dict` initializes the full fit from an earlier fit of the same introns
+    instead of from the grid search over pi. Jackknife replicates are initialized from the fit to
+    all samples.
     """
     coverage = coverage.to(device)
     dataset_metadata = dataset_metadata.to(device)
@@ -2039,7 +2042,10 @@ def get_intron_coverage_model_results(
 
     def fit_full_from_scratch() -> tuple[IntronCoverageModel, TrainingResults]:
         model = build_full_model()
-        model.initialize_parameters(coverage)
+        if hot_start_state_dict is None:
+            model.initialize_parameters(coverage)
+        else:
+            model.load_state_dict(hot_start_state_dict)
         return fit(model, dataset_metadata.design_matrix, 'Intron coverage | full model')
 
     def fit_reduced(model_full: IntronCoverageModel,
@@ -2074,7 +2080,7 @@ def get_intron_coverage_model_results(
     model_param_df = model_full.get_param_df()
     model_param_df['loss_full_model'] = results_full.final_loss
     model_param_df['training_diverged_full_model'] = results_full.training_diverged
-    model_param_df['training_converged_within_max_epochs_full_model'] = results_full.converged_within_max_epochs
+    model_param_df['training_converged_full_model'] = results_full.converged
     model_param_df['num_epochs_full_model'] = results_full.num_epochs
 
     parameter_covariance: Optional[ParameterCovariance] = None
@@ -2130,9 +2136,9 @@ def get_intron_coverage_model_results(
         test_result['loss_full_model'] = results_full.final_loss
         test_result['loss_reduced_model'] = results_reduced.final_loss
         test_result['chi2_test_statistics'] = chi2_stat
-        test_result['p_value'] = stats.chi2.sf(chi2_stat, df=lrt_row['lrt_df'])
+        test_result['p_value_lrt'] = stats.chi2.sf(chi2_stat, df=lrt_row['lrt_df'])
         test_result['training_diverged_reduced_model'] = results_reduced.training_diverged
-        test_result['training_converged_within_max_epochs_reduced_model'] = results_reduced.converged_within_max_epochs
+        test_result['training_converged_reduced_model'] = results_reduced.converged
         test_result['num_epochs_reduced_model'] = results_reduced.num_epochs
         test_result['num_full_model_restarts'] = fits.num_full_model_restarts
         test_results_list.append(test_result)
@@ -2247,9 +2253,10 @@ def get_global_rna_kinetics_model_results(
         global_gene_data: GlobalGeneData,
         dataset_metadata: DatasetMetadata,
         plug_in_coverage_fits: Optional[list[PlugInCoverageFit]] = None,
+        hot_start_state_dict: Optional[StateDict] = None,
         device: str = 'cpu',
         verbose: bool = False,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> ModelFitResults:
     """
     Fit the genome-wide model and run every likelihood ratio test it supports.
 
@@ -2257,6 +2264,15 @@ def get_global_rna_kinetics_model_results(
     coverage fits covering this dataset's introns rather than from here. The LFC is shared across
     the whole dataset, so a single fit over all of them is what this takes, and of the three
     ratios the model can test only two are left: elong/splice is the coverage fit's own test.
+
+    `ratio_lfcs` contains all three ratios, including a plugged-in one, and no standard errors,
+    since this model computes no Fisher information. Jackknife replicates report it, and the
+    contrasts are computed from it afterwards.
+
+    `hot_start_state_dict` initializes the full fit from an earlier fit of the same genes and
+    introns. Jackknife replicates are initialized from the fit to all samples. Under the plug-in,
+    the state dict also carries the coverage values that fit froze; they are replaced by those of
+    `plug_in_coverage_fits` after loading.
     """
     global_gene_data = global_gene_data.to(device)
     dataset_metadata = dataset_metadata.to(device)
@@ -2311,8 +2327,13 @@ def get_global_rna_kinetics_model_results(
 
     def fit_full_from_scratch() -> tuple[GlobalRNAKineticsModel, TrainingResults]:
         model = build_model(None)
-        model.initialize_parameters(global_gene_data, dataset_metadata.library_sizes,
-                                   dataset_metadata.design_matrix)
+        if hot_start_state_dict is None:
+            model.initialize_parameters(global_gene_data, dataset_metadata.library_sizes,
+                                        dataset_metadata.design_matrix)
+        else:
+            model.load_state_dict(hot_start_state_dict)
+            if plug_in_coverage is not None:
+                model.set_plug_in_coverage(plug_in_coverage)
         return fit(model, None, 'Global RNA kinetics | full model')
 
     def fit_reduced(model_full: GlobalRNAKineticsModel,
@@ -2345,7 +2366,7 @@ def get_global_rna_kinetics_model_results(
     model_param_df = model.get_param_df()
     model_param_df['loss_full_model'] = training_results.final_loss
     model_param_df['training_diverged_full_model'] = training_results.training_diverged
-    model_param_df['training_converged_within_max_epochs_full_model'] = training_results.converged_within_max_epochs
+    model_param_df['training_converged_full_model'] = training_results.converged
     model_param_df['num_epochs_full_model'] = training_results.num_epochs
 
     full_state = model.state_dict()
@@ -2366,15 +2387,24 @@ def get_global_rna_kinetics_model_results(
         test_result['loss_full_model'] = training_results.final_loss
         test_result['loss_reduced_model'] = results_reduced.final_loss
         test_result['chi2_test_statistics'] = chi2_stat
-        test_result['p_value'] = stats.chi2.sf(chi2_stat, df=lrt_row['lrt_df'])
+        test_result['p_value_lrt'] = stats.chi2.sf(chi2_stat, df=lrt_row['lrt_df'])
         test_result['training_diverged_reduced_model'] = results_reduced.training_diverged
-        test_result[
-            'training_converged_within_max_epochs_reduced_model'] = results_reduced.converged_within_max_epochs
+        test_result['training_converged_reduced_model'] = results_reduced.converged
         test_result['num_epochs_reduced_model'] = results_reduced.num_epochs
         test_result['num_full_model_restarts'] = fits.num_full_model_restarts
         test_results_list.append(test_result)
 
-    return model_param_df, pd.DataFrame(test_results_list)
+    ratio_lfc_df = get_ratio_lfc_df(
+        model, parameter_covariance=None, with_standard_errors=False,
+        ratios_to_report=[RatioToReport(ratio=tested_ratio,
+                                        lfc_combination=RATIO_AS_LFC_COMBINATION[tested_ratio])
+                          for tested_ratio in GLOBAL_MODEL_TESTED_RATIOS])
+    ratio_lfc_df['training_diverged_full_model'] = training_results.training_diverged
+
+    return ModelFitResults(model_parameters=model_param_df,
+                           ratio_lfcs=ratio_lfc_df,
+                           test_results=pd.DataFrame(test_results_list),
+                           state_dict_full_model=full_state)
 
 
 def get_regularized_intron_coverage_model_results(
@@ -2414,8 +2444,7 @@ def get_regularized_intron_coverage_model_results(
     model_param_df['gene_name'] = input_data.gene_name
     model_param_df['loss_regularized_model'] = training_results_regularized.final_loss
     model_param_df['training_diverged_regularized_model'] = training_results_regularized.training_diverged
-    model_param_df[
-        'training_converged_within_max_epochs_regularized_model'] = training_results_regularized.converged_within_max_epochs
+    model_param_df['training_converged_regularized_model'] = training_results_regularized.converged
 
     # The same rule `IntronCoverageModel.get_param_df` follows, and it has to be: this table and
     # `model_parameters.tsv` are joined on `intron_name` by `merge_regularization.R`.
@@ -2433,3 +2462,145 @@ def get_regularized_intron_coverage_model_results(
             model_regularized, fisher_information_matrix=None,
             training_diverged=training_results_regularized.training_diverged,
             computes_fisher_information=False))
+
+
+class JackknifeStatus(StrEnum):
+    """Availability of jackknife results for a test of a global model."""
+    OK = 'ok'
+    # Removing some sample reduces the rank of the design (with intercept). This occurs for a
+    # group with a single sample, and whenever the number of samples equals the rank, leaving no
+    # residual degrees of freedom.
+    RANK_DEFICIENT = 'rank_deficient'
+    # At least one jackknife replicate diverged.
+    FIT_DIVERGED = 'fit_diverged'
+
+
+JACKKNIFE_NUMERIC_COLUMNS = ('lfc_se_jackknife', 't_statistic_jackknife', 'df_jackknife',
+                             'p_value_jackknife')
+
+
+def _get_rank_with_intercept(design_matrix: np.ndarray) -> int:
+    """Rank of the design matrix augmented with a constant column, which the models' intercepts
+    span."""
+    constant = np.ones((design_matrix.shape[0], 1))
+    return int(np.linalg.matrix_rank(np.hstack([constant, design_matrix])))
+
+
+def get_jackknife_degrees_of_freedom(design_matrix: np.ndarray) -> int:
+    """Residual degrees of freedom of a linear model of the design fitted to one value per sample:
+    `n - rank([1, X])`."""
+    return design_matrix.shape[0] - _get_rank_with_intercept(design_matrix)
+
+
+def get_jackknife_design_status(design_matrix: np.ndarray) -> JackknifeStatus:
+    """
+    Whether the design keeps its rank when any single sample is removed.
+
+    Depends on the design only, so it is evaluated before any fit. The check applies to the whole
+    design rather than to individual contrasts, because each jackknife replicate estimates all
+    design columns jointly, and a replicate with an inestimable column has no unique optimum.
+    """
+    rank = _get_rank_with_intercept(design_matrix)
+    for sample_index in range(design_matrix.shape[0]):
+        if _get_rank_with_intercept(np.delete(design_matrix, sample_index, axis=0)) < rank:
+            return JackknifeStatus.RANK_DEFICIENT
+    return JackknifeStatus.OK
+
+
+def get_jackknife_ratio_lfc_df(results: ModelFitResults, dropped_sample: str) -> pd.DataFrame:
+    """
+    Rate ratio LFCs of one jackknife replicate, labelled with the removed sample.
+
+    The training diagnostics identify replicates that reached the epoch limit without meeting the
+    stopping rule. They do not identify replicates that met the stopping rule before reaching the
+    optimum: the global fits stop on the loss change per epoch, which can fall below the tolerance
+    while the loss is still decreasing.
+    """
+    training_columns = ['loss_full_model', 'num_epochs_full_model',
+                        'training_converged_full_model']
+    return results.ratio_lfcs.assign(
+        dropped_sample=dropped_sample,
+        **{column: results.model_parameters[column].iloc[0] for column in training_columns})
+
+
+def add_jackknife_results(test_results: pd.DataFrame,
+                          jackknife_ratio_lfcs: pd.DataFrame,
+                          design_matrix: np.ndarray,
+                          sample_names: list[str]) -> pd.DataFrame:
+    """
+    Add delete-one-sample jackknife standard errors and t tests to a global model's test results.
+
+    A global LFC is a single effect shared by all genes or introns, so its sampling variance is
+    determined by the variation between samples. The likelihood treats genes as independent
+    replicates: variation shared by all genes within a sample, whether technical (for example,
+    the fraction of nascent RNA captured in a library) or biological (for example, a replicate's
+    overall elongation or splicing speed), is averaged over genes as if it were independent
+    between them, although it is a single draw per sample. The LRT is therefore anti-conservative for a
+    global effect. Refitting the model with each sample removed in turn estimates the variance
+    between samples directly.
+
+    `jackknife_ratio_lfcs` contains one fit per removed sample, identified by `dropped_sample`,
+    in the format of `ratio_lfcs`: one row per rate ratio and design column. `sample_names` lists
+    all samples of the design, in the row order of `design_matrix`; each must appear exactly once
+    as `dropped_sample`. Each test's contrast is computed from every replicate as from the full
+    fit, and the standard error is
+    `sqrt((n - 1) / n * sum_i (lfc_i - lfc_mean)^2)`, where `n` is the number of samples, `lfc_i`
+    the contrast estimated with sample `i` removed and `lfc_mean` the average of the `lfc_i`. The
+    t statistic is the full fit's `lfc` divided by this standard error, with `n - rank([1, X])`
+    degrees of freedom, `X` being the design matrix.
+
+    The jackknife variance is conservative in small groups. For the difference between the means
+    of two groups `g = 1, 2`, with `n_g` samples and sample variance `s_g^2` in group `g`, the
+    unbiased variance estimate is `sum_g s_g^2 / n_g`; the jackknife variance is
+    `(n - 1) / n * sum_g s_g^2 / (n_g - 1)`, which exceeds it by the factor
+    `(n - 1) / n * n_g / (n_g - 1)` in each group's term.
+
+    Tests without jackknife results retain the jackknife columns, set to NaN, and
+    `jackknife_status` records the reason.
+    """
+    test_results = test_results.copy()
+    for column in JACKKNIFE_NUMERIC_COLUMNS:
+        test_results[column] = np.nan
+    status = get_jackknife_design_status(design_matrix)
+    test_results['jackknife_status'] = str(status)
+    if status != JackknifeStatus.OK:
+        return test_results
+
+    # Both checks detect wiring errors: the workflow runs one replicate per sample whenever the
+    # design passes the check above.
+    if sorted(set(jackknife_ratio_lfcs['dropped_sample'])) != sorted(sample_names):
+        raise ValueError(f'The jackknife fits leave out '
+                         f'{sorted(set(jackknife_ratio_lfcs["dropped_sample"]))}, '
+                         f'not every sample of the design: {sorted(sample_names)}.')
+    lfc_by_key = jackknife_ratio_lfcs.set_index(
+        ['dropped_sample', 'rate_ratio', 'feature_name'])['lfc']
+    if not lfc_by_key.index.is_unique:
+        raise ValueError('The jackknife fits report a rate ratio and design column more than once '
+                         'for the same left-out sample.')
+
+    if jackknife_ratio_lfcs['training_diverged_full_model'].astype(bool).any():
+        test_results['jackknife_status'] = str(JackknifeStatus.FIT_DIVERGED)
+        return test_results
+
+    num_samples = len(sample_names)
+    degrees_of_freedom = get_jackknife_degrees_of_freedom(design_matrix)
+    for row_index, row in test_results.iterrows():
+        def get_lfc_of_column_without(sample_name: str, column_name) -> float:
+            # An absent column contributes zero, as in `get_lfc_of_column`.
+            if pd.isna(column_name):
+                return 0.0
+            return float(lfc_by_key.loc[(sample_name, row['rate_ratio'], column_name)])
+
+        lfc_without_sample = np.array([
+            get_lfc_of_column_without(sample_name, row['lfc_column_positive'])
+            - get_lfc_of_column_without(sample_name, row['lfc_column_negative'])
+            for sample_name in sample_names])
+        lfc_se = np.sqrt((num_samples - 1) / num_samples
+                         * np.sum((lfc_without_sample - lfc_without_sample.mean()) ** 2))
+        t_statistic = row['lfc'] / lfc_se
+        test_results.loc[row_index, 'lfc_se_jackknife'] = lfc_se
+        test_results.loc[row_index, 't_statistic_jackknife'] = t_statistic
+        test_results.loc[row_index, 'df_jackknife'] = degrees_of_freedom
+        test_results.loc[row_index, 'p_value_jackknife'] = 2 * stats.t.sf(abs(t_statistic),
+                                                                           degrees_of_freedom)
+    return test_results

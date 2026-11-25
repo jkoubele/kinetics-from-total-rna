@@ -115,7 +115,8 @@ workflow {
             as_boolean(params.fit_gene_specific_intron_coverage_model),
             as_boolean(params.fit_intron_specific_intron_coverage_model),
             as_boolean(params.use_plug_in_coverage),
-            params.count_distribution
+            params.count_distribution,
+            as_boolean(params.jackknife_global_models)
         )
     }
 }

@@ -10,7 +10,8 @@ from tqdm import tqdm
 
 from rna_kinetics.data import MODEL_DTYPE, load_dataset_metadata
 from rna_kinetics.estimation import (get_intron_coverage_model_results,
-                                     concat_plug_in_coverage_fits)
+                                     concat_plug_in_coverage_fits, get_jackknife_design_status,
+                                     get_jackknife_ratio_lfc_df, JackknifeStatus)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -42,6 +43,16 @@ if __name__ == "__main__":
                         type=Path,
                         default=Path('.'),
                         help='Output folder.')
+    parser.add_argument('--jackknife_drop_sample',
+                        default=None,
+                        help='Fit one jackknife replicate: the full model only, with this sample '
+                             'left out. Writes its rate ratio LFCs and its coverage fit for the '
+                             'matching RNA kinetics replicate instead of the usual outputs.')
+    parser.add_argument('--hot_start_state_dict',
+                        type=Path,
+                        default=None,
+                        help='Model state to start the full fit from, which a jackknife replicate '
+                             'takes from the fit to all samples.')
     args = parser.parse_args()
 
     args.output_folder.mkdir(exist_ok=True, parents=True)
@@ -52,6 +63,13 @@ if __name__ == "__main__":
         lrt_metadata_file=args.lrt_metadata,
         reduced_matrices_folder=args.reduced_matrices_folder,
     )
+    if args.jackknife_drop_sample is not None:
+        # The workflow launches the replicates only for a design that passes this check.
+        if (get_jackknife_design_status(dataset_metadata.design_matrix.numpy())
+                != JackknifeStatus.OK):
+            raise ValueError('Leaving out a sample makes this design rank deficient, so it has no '
+                             'jackknife replicates.')
+        dataset_metadata = dataset_metadata.without_sample(args.jackknife_drop_sample)
 
     modeled_introns_df = pd.read_csv(args.modeled_introns, sep='\t')
     intron_names = modeled_introns_df['intron_id'].tolist()
@@ -70,13 +88,29 @@ if __name__ == "__main__":
 
     # No ratio_lfcs here: the global model is not regularized, and with no Fisher information
     # there would be no standard error for the prior fit to use anyway.
+    hot_start_state_dict = None
+    if args.hot_start_state_dict is not None:
+        hot_start_state_dict = torch.load(args.hot_start_state_dict, weights_only=False)
+
     results = get_intron_coverage_model_results(
         coverage=coverage,
         dataset_metadata=dataset_metadata,
         intron_names=intron_names,
         is_global_model=True,
+        hot_start_state_dict=hot_start_state_dict,
         verbose=True,
     )
+    plug_in_coverage_fits = concat_plug_in_coverage_fits([results.plug_in_coverage_fit],
+                                                         dataset_metadata.feature_names)
+
+    if args.jackknife_drop_sample is not None:
+        get_jackknife_ratio_lfc_df(results, args.jackknife_drop_sample).to_csv(
+            args.output_folder / f'jackknife_ratio_lfcs_{args.jackknife_drop_sample}.tsv',
+            sep='\t', index=False)
+        # Frozen by the RNA kinetics replicate leaving out the same sample, so that the
+        # jackknife covers the uncertainty of both stages of the plug-in estimator.
+        torch.save(plug_in_coverage_fits, args.output_folder / 'plug_in_coverage_fits.pt')
+        raise SystemExit(0)
 
     results.model_parameters.to_csv(
         args.output_folder / 'model_parameters.tsv', sep='\t', index=False
@@ -84,6 +118,6 @@ if __name__ == "__main__":
     results.test_results.to_csv(args.output_folder / 'test_results.tsv', sep='\t', index=False)
     # One fit over every intron in the dataset, so one record, and no covariance: this model
     # computes no Fisher information.
-    torch.save(concat_plug_in_coverage_fits([results.plug_in_coverage_fit],
-                                            dataset_metadata.feature_names),
-               args.output_folder / 'plug_in_coverage_fits.pt')
+    torch.save(plug_in_coverage_fits, args.output_folder / 'plug_in_coverage_fits.pt')
+    # The starting point of the jackknife replicates.
+    torch.save(results.state_dict_full_model, args.output_folder / 'model_state_dict.pt')

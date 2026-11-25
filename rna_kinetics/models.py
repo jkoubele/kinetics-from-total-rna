@@ -875,6 +875,22 @@ class GlobalRNAKineticsModel(nn.Module):
                     f"got {lrt_specification.tested_ratio!r}.")
             self.reduced_lfc = nn.Parameter(torch.zeros(lrt_specification.num_features_reduced_matrix))
 
+    def set_plug_in_coverage(self, plug_in_coverage: PlugInCoverage) -> None:
+        """
+        Copy a coverage fit's values into the plug-in buffers.
+
+        As in `RNAKineticsModel.set_plug_in_coverage`: `load_state_dict` restores the buffers, so
+        a hot start taken from a fit that froze other coverage values overwrites them, and has to
+        be followed by this call.
+        """
+        if not self.coverage_is_plugged_in:
+            raise ValueError('Nothing is plugged in to set: this model estimates '
+                             'lfc_elong_over_splice and intercept_pi_logit itself.')
+        plug_in_coverage.check_shapes((len(self.feature_names), 1), len(self.intron_names))
+        with torch.no_grad():
+            self.lfc_elong_over_splice.copy_(plug_in_coverage.lfc_elong_over_splice[:, 0])
+            self.intercept_pi_logit.copy_(plug_in_coverage.intercept_pi_logit)
+
     def initialize_parameters(self,
                               global_gene_data: GlobalGeneData,
                               library_sizes: torch.Tensor,

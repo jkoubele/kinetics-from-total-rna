@@ -102,7 +102,18 @@ likelihood-ratio tests, with the null hypothesis that the corresponding LFC is e
 computed from the Fisher information of the fitted model. The likelihood-ratio test is the primary
 and the more reliable of the two; the Wald test needs no additional model fit, so we report it as a
 cheap supplement. The two global models do not compute a Fisher information, and therefore report
-the likelihood-ratio test alone.
+no Wald test.
+
+The global models are instead accompanied by a delete-one-sample jackknife, enabled by default
+(```jackknife_global_models```). Their likelihood-ratio test treats the genes as independent
+replicates, while part of the variation between samples, technical or biological, affects all genes
+of a sample at once. Such variation does not average out over genes, so the likelihood-ratio p-value
+of a global effect is far too small. The jackknife refits each global model once per sample, leaving
+that sample out, and estimates the standard error from how much the effect moves between these
+refits. The resulting `p_value_jackknife` is the one shown in the plots of the global models. It
+needs at least two samples in every group, and adds one fit of each global model per sample. For a
+paired design (e.g. treated and control samples from each donor) the test is conservative, since
+it leaves out single samples rather than whole pairs.
 
 ## Model variants
 
@@ -157,8 +168,8 @@ not enter them.
 
 We recommend starting with the global and per-gene models of both families, which is also the
 default setting in the [dataset_params_template.yaml](dataset_params_template.yaml) file. The global
-models tell you whether there is a dataset-wide shift, and they are well powered even for small
-experiments, while the per-gene models identify which genes are driving it.
+models tell you whether there is a dataset-wide shift, while the per-gene models identify which
+genes are driving it.
 
 The two per-intron models are disabled by default. They are the most granular, but also the least
 powered, since each estimate is based on a single intron; moreover, the per-intron RNA kinetics
