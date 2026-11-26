@@ -100,18 +100,16 @@ The effect sizes are always reported as log2 fold changes. Each one is tested wi
 hypothesis that the corresponding LFC is equal to zero (see *Contrasts* below), and which test we
 use depends on the model:
 
-* The **intron coverage models** use the likelihood-ratio test. The coverage shape can pin the
-  fraction of nascent reads at 0 or 1, where the likelihood becomes flat, and the Wald test, which
-  approximates the likelihood by a quadratic function, then loses power exactly for the largest
-  effects.
-* The **RNA kinetics models** use the Wald test for the five ratios they estimate from the read
-  counts. They take the elongation over splicing effect over from the intron coverage model (see
-  *Model variants* below), and the Wald test is corrected for that estimate not being exact, while
-  the likelihood-ratio test treats it as known and so gives p-values that are too small. Their
-  `lfc_elong_over_splice` rows come from the intron coverage model, with its likelihood-ratio
-  test. The likelihood-ratio tests of the per-gene and per-intron RNA kinetics models need one
-  extra fit per test and are off by default; set ```run_plug_in_lrt``` to true to add them as an
-  extra column.
+* The **intron coverage models** use the likelihood-ratio test. The log-likelihood of the
+  coverage shape can be flat in some directions, and the Wald test then loses power exactly for
+  the largest effects.
+* The **RNA kinetics models** take `lfc_elong_over_splice` over from the intron coverage model
+  (see *Model variants* below), so its rows come with that model's likelihood-ratio test. The
+  remaining five ratios use the Wald test, which accounts for the uncertainty of the estimate
+  taken over, while their likelihood-ratio test treats it as known and so gives p-values that are
+  too small. That likelihood-ratio test also needs one extra fit per test, so it is off by default
+  in the per-gene and per-intron models; set ```run_plug_in_lrt``` to true to add it as an extra
+  column.
 * The **global models** use the jackknife described below.
 
 Every p-value column names its test (`p_value_lrt`, `p_value_wald`, `p_value_jackknife`), and each
@@ -124,9 +122,9 @@ replicates, while part of the variation between samples, technical or biological
 of a sample at once. Such variation does not average out over genes, so the likelihood-ratio p-value
 of a global effect is far too small. The jackknife refits each global model once per sample, leaving
 that sample out, and estimates the standard error from how much the effect moves between these
-refits. The resulting `p_value_jackknife` is the one shown in the plots of the global models, and
-their likelihood-ratio test is kept for comparison (```run_global_plug_in_lrt```). The
-jackknife needs at least two samples in every group, and adds one fit of each global model per sample. For a
+refits. The resulting `p_value_jackknife` is the one shown in the plots of the global models. Their
+likelihood-ratio test is still computed by default, for comparison; you can switch it off by
+setting ```run_global_plug_in_lrt``` to false. The jackknife needs at least two samples in every group, and adds one fit of each global model per sample. For a
 paired design (e.g. treated and control samples from each donor) the test is conservative, since
 it leaves out single samples rather than whole pairs.
 
