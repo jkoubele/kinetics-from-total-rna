@@ -8,8 +8,9 @@ import torch
 from tqdm import tqdm
 
 from rna_kinetics.data import load_dataset_metadata, load_intron_coverage_list
-from rna_kinetics.estimation import (get_intron_coverage_model_results, CacheForRegularization,
-                                     PlugInCoverageFit, concat_plug_in_coverage_fits)
+from rna_kinetics.models import PlugInCoverageFit
+from rna_kinetics.inference import concat_plug_in_coverage_fits
+from rna_kinetics.estimation import get_intron_coverage_model_results, CacheForRegularization
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

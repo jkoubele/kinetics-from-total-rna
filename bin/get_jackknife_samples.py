@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from rna_kinetics.estimation import (get_jackknife_design_status, get_jackknife_degrees_of_freedom,
-                                     JackknifeStatus)
+from rna_kinetics.inference import (get_jackknife_design_status, get_jackknife_degrees_of_freedom,
+                                    JackknifeStatus)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
