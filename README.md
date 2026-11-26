@@ -96,13 +96,25 @@ pooled across genes to obtain a dataset-wide estimate. For this reason, the glob
 model tests the three ratios that do not involve the initiation rate: `lfc_elong_over_deg`,
 `lfc_splice_over_deg` and `lfc_elong_over_splice`.
 
-The effect sizes are always reported as log2 fold changes. Their significance is assessed by
-likelihood-ratio tests, with the null hypothesis that the corresponding LFC is equal to zero (see
-*Contrasts* below). Each test is also accompanied by a Wald test of the same null hypothesis,
-computed from the Fisher information of the fitted model. The likelihood-ratio test is the primary
-and the more reliable of the two; the Wald test needs no additional model fit, so we report it as a
-cheap supplement. The two global models do not compute a Fisher information, and therefore report
-no Wald test.
+The effect sizes are always reported as log2 fold changes. Each one is tested with the null
+hypothesis that the corresponding LFC is equal to zero (see *Contrasts* below), and which test we
+use depends on the model:
+
+* The **intron coverage models** use the likelihood-ratio test. The log-likelihood of the
+  coverage shape can be flat in some directions, and the Wald test then loses power exactly for
+  the largest effects.
+* The **RNA kinetics models** take `lfc_elong_over_splice` over from the intron coverage model
+  (see *Model variants* below), so its rows come with that model's likelihood-ratio test. The
+  remaining five ratios use the Wald test, which accounts for the uncertainty of the estimate
+  taken over, while their likelihood-ratio test treats it as known and so gives p-values that are
+  too small. That likelihood-ratio test also needs one extra fit per test, so it is off by default
+  in the per-gene and per-intron models; set ```run_plug_in_lrt``` to true to add it as an extra
+  column.
+* The **global models** use the jackknife described below.
+
+Every p-value column names its test (`p_value_lrt`, `p_value_wald`, `p_value_jackknife`), and each
+plot says which test it shows. The two global models do not compute a Fisher information, and
+therefore report no Wald test.
 
 The global models are instead accompanied by a delete-one-sample jackknife, enabled by default
 (```jackknife_global_models```). Their likelihood-ratio test treats the genes as independent
@@ -110,8 +122,9 @@ replicates, while part of the variation between samples, technical or biological
 of a sample at once. Such variation does not average out over genes, so the likelihood-ratio p-value
 of a global effect is far too small. The jackknife refits each global model once per sample, leaving
 that sample out, and estimates the standard error from how much the effect moves between these
-refits. The resulting `p_value_jackknife` is the one shown in the plots of the global models. It
-needs at least two samples in every group, and adds one fit of each global model per sample. For a
+refits. The resulting `p_value_jackknife` is the one shown in the plots of the global models. Their
+likelihood-ratio test is still computed by default, for comparison; you can switch it off by
+setting ```run_global_plug_in_lrt``` to false. The jackknife needs at least two samples in every group, and adds one fit of each global model per sample. For a
 paired design (e.g. treated and control samples from each donor) the test is conservative, since
 it leaves out single samples rather than whole pairs.
 
@@ -158,7 +171,8 @@ You can instead fit both stages at once, by setting ```use_plug_in_coverage``` t
 recommend it: one gene's intron coverage carries far less information about the elongation over
 splicing effect than its read counts carry about everything else, so a joint fit lets the counts
 pull that effect away from what the coverage shape supports. Those results are written to a
-separate ```*_joint_likelihood``` folder, so the two can be compared side by side.
+separate ```*_joint_likelihood``` folder, so the two can be compared side by side. The joint fit
+always runs its likelihood-ratio tests, and its volcano plots use them.
 
 The read counts of an RNA kinetics model follow a negative binomial distribution, with
 dispersions estimated by [DESeq2](https://bioconductor.org/packages/DESeq2/) and held fixed;

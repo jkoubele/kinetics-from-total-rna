@@ -9,6 +9,11 @@ parser$add_argument("--test_results", required = TRUE,
 parser$add_argument("--model_type", required = TRUE,
                     choices = c("rna_kinetics", "intron_coverage"),
                     help = "Model type: rna_kinetics or intron_coverage.")
+parser$add_argument("--p_value_test", required = TRUE,
+                    choices = c("wald", "lrt"),
+                    help = paste("Test the volcano plots use for the model's own rows. Rows taken",
+                                 "over from the intron coverage model (source_model) always use",
+                                 "their likelihood ratio test."))
 parser$add_argument("--output_folder", default = '.', help = "Path to output folder.")
 
 args <- parser$parse_args()
@@ -44,6 +49,32 @@ test_results <- test_results |>
 
 write_tsv(test_results, file.path(output_folder, "test_results.tsv"))
 
+# The test behind each row's plotted p-value. Under the plug-in, the coverage arm's rows sit beside
+# the kinetics model's own, but each volcano plot covers one rate_ratio and so a single test.
+has_coverage_arm <- "source_model" %in% colnames(test_results)
+test_results <- test_results |>
+  mutate(
+    from_coverage_arm = if (has_coverage_arm) coalesce(source_model == "intron_coverage", FALSE)
+                        else FALSE,
+    plotted_test      = if_else(from_coverage_arm, "lrt", args$p_value_test)
+  )
+
+test_names <- c(
+  wald = "Wald test",
+  lrt  = "likelihood ratio test"
+)
+
+get_test_caption <- function(plotted_test, from_coverage_arm) {
+  if (from_coverage_arm) {
+    return("Likelihood ratio test of the intron coverage model, from which this ratio is taken over.")
+  }
+  if (plotted_test == "wald" && has_coverage_arm) {
+    return(paste("Wald test, with standard errors that account for the estimate taken over from",
+                 "the intron coverage model."))
+  }
+  paste0(str_to_sentence(test_names[[plotted_test]]), ".")
+}
+
 min_p_value      <- 1e-20
 fdr_threshold    <- 0.05
 l2fc_clamp_value <- 5
@@ -55,9 +86,20 @@ make_volcano_plots <- function(test_results, base_output_subfolder, lfc_col, lfc
 
     for (plot_test_id in unique(test_results$test_id)) {
       plot_test_results <- test_results |>
-        filter(rate_ratio == plot_rate_ratio, test_id == plot_test_id) |>
+        filter(rate_ratio == plot_rate_ratio, test_id == plot_test_id)
+      plotted_test <- unique(plot_test_results$plotted_test)
+      stopifnot(length(plotted_test) == 1)
+      test_caption <- get_test_caption(plotted_test, all(plot_test_results$from_coverage_arm))
+
+      # A unit the test could not be computed for (no p-value, e.g. an LFC the Wald test reports
+      # as not identifiable) is left out of the FDR and the plot, and counted in the subtitle.
+      plot_test_results <- plot_test_results |>
+        mutate(p_value_plotted = if (.env$plotted_test == "wald") p_value_wald else p_value_lrt)
+      num_not_testable <- sum(is.na(plot_test_results$p_value_plotted))
+      plot_test_results <- plot_test_results |>
+        filter(!is.na(p_value_plotted)) |>
         mutate(
-          p_value_clipped = pmax(p_value_lrt, min_p_value),
+          p_value_clipped = pmax(p_value_plotted, min_p_value),
           fdr             = p.adjust(p_value_clipped, method = "fdr"),
           l2fc_plot       = .data[[lfc_col]],
           category        = case_when(
@@ -73,10 +115,13 @@ make_volcano_plots <- function(test_results, base_output_subfolder, lfc_col, lfc
       stopifnot(length(unique(plot_test_results$group_1)) <= 1)
       stopifnot(length(unique(plot_test_results$group_2)) <= 1)
 
-      cat_counts <- table(plot_test_results$category)
-      cat_text   <- paste0("down: ", cat_counts["down"], " | ",
-                           "not significant: ", cat_counts["not_significant"], " | ",
-                           "up: ", cat_counts["up"])
+      count_category <- function(category) sum(plot_test_results$category == category)
+      cat_text <- paste0("down: ", count_category("down"), " | ",
+                         "not significant: ", count_category("not_significant"), " | ",
+                         "up: ", count_category("up"))
+      if (num_not_testable > 0) {
+        cat_text <- paste0(cat_text, " | not testable: ", num_not_testable)
+      }
 
       group_1 <- plot_test_results |>
         summarize(v = if (all(is.na(group_1))) NA else first(group_1, default = NA)) |>
@@ -100,11 +145,13 @@ make_volcano_plots <- function(test_results, base_output_subfolder, lfc_col, lfc
           title    = title_nice,
           subtitle = cat_text,
           x        = lfc_label,
-          y        = "-log10(FDR)",
-          color    = ""
+          y        = paste0("-log10(FDR), ", test_names[[plotted_test]]),
+          color    = "",
+          caption  = test_caption
         ) +
         theme_classic() +
-        theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+        theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5),
+              plot.caption = element_text(size = 9, color = "grey40", hjust = 0))
 
       file_name <- tested_variable
       if (!is.na(group_1) && !is.na(group_2)) {

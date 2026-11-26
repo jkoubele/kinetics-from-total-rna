@@ -116,7 +116,9 @@ workflow {
             as_boolean(params.fit_intron_specific_intron_coverage_model),
             as_boolean(params.use_plug_in_coverage),
             params.count_distribution,
-            as_boolean(params.jackknife_global_models)
+            as_boolean(params.jackknife_global_models),
+            as_boolean(params.run_plug_in_lrt),
+            as_boolean(params.run_global_plug_in_lrt)
         )
     }
 }

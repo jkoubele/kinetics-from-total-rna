@@ -132,7 +132,8 @@ process FitRNAKineticsModel {
         path(plug_in_coverage_fits),
         path(exon_count_dispersions),
         path(intron_count_dispersions),
-        val(count_distribution)
+        val(count_distribution),
+        val(run_lrt)
     )
 
     output:
@@ -166,6 +167,7 @@ process FitRNAKineticsModel {
     --reduced_matrices_folder ${reduced_matrices_folder} \
     --intron_specific_lfc ${intron_specific_lfc} \
     --count_distribution ${count_distribution} \
+    --run_lrt ${run_lrt} \
     ${dispersions_argument} \
     ${plug_in_argument} \
     --output_folder . \
@@ -334,6 +336,7 @@ process FitGlobalRNAKineticsModel {
         path(exon_count_dispersions),
         path(intron_count_dispersions),
         val(count_distribution),
+        val(run_lrt),
         val(model_type_subfolder)
     )
 
@@ -363,6 +366,7 @@ process FitGlobalRNAKineticsModel {
     --lrt_metadata ${lrt_metadata} \
     --reduced_matrices_folder ${reduced_matrices_folder} \
     --count_distribution ${count_distribution} \
+    --run_lrt ${run_lrt} \
     ${dispersions_argument} \
     ${plug_in_argument}
     mv test_results.tsv test_results_raw.tsv
@@ -657,6 +661,9 @@ process PostprocessResultsAndPlot {
     path raw_test_results
     val model_type
     val model_type_subfolder
+    // The test the volcano plots use for the model's own rows. The coverage arm's rows, which a
+    // plug-in fit carries for lfc_elong_over_splice, always use their likelihood ratio test.
+    val p_value_test
 
     output:
     path("test_results/test_results.tsv"), emit: test_results
@@ -667,6 +674,7 @@ process PostprocessResultsAndPlot {
     postprocess_results.R \
     --test_results $raw_test_results \
     --model_type $model_type \
+    --p_value_test $p_value_test \
     --output_folder test_results
     """
 }
@@ -710,6 +718,7 @@ workflow gene_specific_rna_kinetics_model_subworkflow {
         use_plug_in_coverage
         count_dispersions
         count_distribution
+        run_lrt
 
     main:
         // The joint likelihood writes to its own folder, so which estimator produced
@@ -743,7 +752,7 @@ workflow gene_specific_rna_kinetics_model_subworkflow {
         def model_input = (count_distribution == 'negative_binomial'
             ? model_input_without_dispersions.combine(count_dispersions)
             : model_input_without_dispersions.map { chunk_input -> chunk_input + [[], []] })
-            .map { chunk_input -> chunk_input + [count_distribution] }
+            .map { chunk_input -> chunk_input + [count_distribution, run_lrt] }
 
         def fit_output = FitRNAKineticsModel(model_input)
 
@@ -783,7 +792,10 @@ workflow gene_specific_rna_kinetics_model_subworkflow {
               ).raw_test_results
             : merge_regularization_output.raw_test_results
 
-        PostprocessResultsAndPlot(test_results, 'rna_kinetics', model_subfolder)
+        // Under the plug-in the likelihood ratio tests treat the frozen coverage values as known,
+        // while the Wald test accounts for them, so the plots use the Wald test there.
+        PostprocessResultsAndPlot(test_results, 'rna_kinetics', model_subfolder,
+                                  use_plug_in_coverage ? 'wald' : 'lrt')
 }
 
 
@@ -805,6 +817,7 @@ workflow intron_specific_rna_kinetics_model_subworkflow {
         use_plug_in_coverage
         count_dispersions
         count_distribution
+        run_lrt
 
     main:
         // The joint likelihood writes to its own folder, so which estimator produced
@@ -838,7 +851,7 @@ workflow intron_specific_rna_kinetics_model_subworkflow {
         def model_input = (count_distribution == 'negative_binomial'
             ? model_input_without_dispersions.combine(count_dispersions)
             : model_input_without_dispersions.map { chunk_input -> chunk_input + [[], []] })
-            .map { chunk_input -> chunk_input + [count_distribution] }
+            .map { chunk_input -> chunk_input + [count_distribution, run_lrt] }
 
         def fit_output = FitRNAKineticsModel(model_input)
 
@@ -878,7 +891,10 @@ workflow intron_specific_rna_kinetics_model_subworkflow {
               ).raw_test_results
             : merge_regularization_output.raw_test_results
 
-        PostprocessResultsAndPlot(test_results, 'rna_kinetics', model_subfolder)
+        // Under the plug-in the likelihood ratio tests treat the frozen coverage values as known,
+        // while the Wald test accounts for them, so the plots use the Wald test there.
+        PostprocessResultsAndPlot(test_results, 'rna_kinetics', model_subfolder,
+                                  use_plug_in_coverage ? 'wald' : 'lrt')
 }
 
 
@@ -941,7 +957,8 @@ workflow gene_specific_intron_coverage_model_subworkflow {
         def regularized_plug_in_output = MergeRegularizedPlugInCoverageFits(
             fit_regularized_output.regularized_plug_in_coverage_fits_chunk.collect())
 
-        PostprocessResultsAndPlot(merge_regularization_output.raw_test_results, 'intron_coverage', model_subfolder)
+        PostprocessResultsAndPlot(merge_regularization_output.raw_test_results, 'intron_coverage',
+                                  model_subfolder, 'lrt')
 
     emit:
         // Two stages of the same fit. An RNA kinetics model freezes the first in its own
@@ -1005,7 +1022,8 @@ workflow intron_specific_intron_coverage_model_subworkflow {
         def regularized_plug_in_output = MergeRegularizedPlugInCoverageFits(
             fit_regularized_output.regularized_plug_in_coverage_fits_chunk.collect())
 
-        PostprocessResultsAndPlot(merge_regularization_output.raw_test_results, 'intron_coverage', model_subfolder)
+        PostprocessResultsAndPlot(merge_regularization_output.raw_test_results, 'intron_coverage',
+                                  model_subfolder, 'lrt')
 
     emit:
         // Two stages of the same fit. An RNA kinetics model freezes the first in its own
@@ -1095,6 +1113,7 @@ workflow global_rna_kinetics_model_subworkflow {
         use_plug_in_coverage
         count_dispersions
         count_distribution
+        run_lrt
         jackknife_global_models
         jackknife_samples
         jackknife_plug_in_coverage_fits
@@ -1129,7 +1148,7 @@ workflow global_rna_kinetics_model_subworkflow {
             (count_distribution == 'negative_binomial'
                 ? fit_input_without_dispersions.combine(count_dispersions)
                 : fit_input_without_dispersions.map { fit_input -> fit_input + [[], []] })
-                .map { fit_input -> fit_input + [count_distribution, model_subfolder] }
+                .map { fit_input -> fit_input + [count_distribution, run_lrt, model_subfolder] }
         )
 
         def kinetics_test_results = fit_output.test_results
@@ -1227,6 +1246,8 @@ workflow modeling_workflow {
         use_plug_in_coverage
         count_distribution
         jackknife_global_models
+        run_plug_in_lrt
+        run_global_plug_in_lrt
 
     main:
         if (!(count_distribution in ['negative_binomial', 'poisson'])) {
@@ -1382,7 +1403,9 @@ workflow modeling_workflow {
                 use_plug_in_coverage ? gene_specific_coverage_output.raw_test_results : channel.empty(),
                 use_plug_in_coverage,
                 count_dispersions,
-                count_distribution
+                count_distribution,
+                // The joint likelihood always runs its likelihood ratio tests.
+                !use_plug_in_coverage || run_plug_in_lrt
             )
         }
 
@@ -1406,7 +1429,9 @@ workflow modeling_workflow {
                 use_plug_in_coverage ? intron_specific_coverage_output.raw_test_results : channel.empty(),
                 use_plug_in_coverage,
                 count_dispersions,
-                count_distribution
+                count_distribution,
+                // The joint likelihood always runs its likelihood ratio tests.
+                !use_plug_in_coverage || run_plug_in_lrt
             )
         }
 
@@ -1428,6 +1453,7 @@ workflow modeling_workflow {
                 use_plug_in_coverage,
                 count_dispersions,
                 count_distribution,
+                !use_plug_in_coverage || run_global_plug_in_lrt,
                 run_jackknife,
                 jackknife_samples,
                 use_plug_in_coverage ? global_coverage_output.jackknife_plug_in_coverage_fits
