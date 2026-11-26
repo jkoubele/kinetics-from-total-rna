@@ -1660,6 +1660,31 @@ def fit_full_and_reduced_models(
                               num_full_model_restarts=num_full_model_restarts)
 
 
+def get_lrt_results(results_full: TrainingResults,
+                    results_reduced: Optional[TrainingResults],
+                    lrt_df: int) -> dict:
+    """
+    The likelihood ratio test columns of one row of test results.
+
+    All null where `results_reduced` is None, that is where the reduced model was not fitted, so
+    that a table without likelihood ratio tests keeps the columns of one with them.
+    """
+    if results_reduced is None:
+        return {'loss_reduced_model': np.nan,
+                'chi2_test_statistics': np.nan,
+                'p_value_lrt': np.nan,
+                'training_diverged_reduced_model': None,
+                'training_converged_reduced_model': None,
+                'num_epochs_reduced_model': None}
+    chi2_statistic = 2 * (results_reduced.final_loss - results_full.final_loss)
+    return {'loss_reduced_model': results_reduced.final_loss,
+            'chi2_test_statistics': chi2_statistic,
+            'p_value_lrt': stats.chi2.sf(chi2_statistic, df=lrt_df),
+            'training_diverged_reduced_model': results_reduced.training_diverged,
+            'training_converged_reduced_model': results_reduced.converged,
+            'num_epochs_reduced_model': results_reduced.num_epochs}
+
+
 def _iter_reported_ratios(intron_names: list[str],
                           intron_specific_lfc: bool,
                           tested_ratios: Sequence[TestedRatio] = tuple(TestedRatio)
@@ -1695,6 +1720,7 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
                                    dataset_metadata: DatasetMetadata,
                                    intron_specific_lfc: bool,
                                    plug_in_coverage_fits: Optional[list[PlugInCoverageFit]] = None,
+                                   run_lrt: bool = True,
                                    device='cpu'
                                    ) -> ModelFitResults:
     """
@@ -1710,6 +1736,9 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
     `get_two_stage_parameter_covariance`, so they are comparable with those of a joint fit. The
     chi-squared statistics do not: each reduced fit treats the plugged-in values as known, so the
     likelihood ratio tests are anti-conservative where the Wald columns beside them are not.
+
+    With `run_lrt` False no reduced model is fitted. The test results keep one row per test, with
+    the Wald columns filled and the likelihood ratio test columns null.
     """
     gene_data = gene_data.to(device)
     dataset_metadata = dataset_metadata.to(device)
@@ -1784,7 +1813,7 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
     fits = fit_full_and_reduced_models(fit_full_from_scratch=fit_full_from_scratch,
                                        fit_reduced=fit_reduced,
                                        refit_full_from_reduced=refit_full_from_reduced,
-                                       num_reduced_models=len(lrt_inputs))
+                                       num_reduced_models=len(lrt_inputs) if run_lrt else 0)
     model_full, results_full = fits.model_full, fits.results_full
 
     # Everything below is derived from the full fit, so it has to come after the restart loop:
@@ -1851,7 +1880,7 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
     test_results_list: list[dict] = []
     for lrt_index, lrt_input in enumerate(lrt_inputs):
         lrt_specification = lrt_input.lrt_specification
-        results_reduced = fits.results_reduced[lrt_index]
+        results_reduced = fits.results_reduced[lrt_index] if run_lrt else None
         tested_intron_index = _get_tested_intron_index(gene_data, lrt_specification)
         # Read off the tested ratio rather than the parameter table: three of the six ratios have
         # no row of their own there.
@@ -1862,9 +1891,6 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
         test_result['rate_ratio'] = lrt_specification.tested_ratio
         test_result['gene_name'] = gene_data.gene_name
         test_result['intron_name'] = lrt_specification.tested_intron
-        test_result['training_diverged_reduced_model'] = results_reduced.training_diverged
-        test_result['training_converged_reduced_model'] = results_reduced.converged
-        test_result['num_epochs_reduced_model'] = results_reduced.num_epochs
         test_result['lfc'] = (
                 get_lfc_of_column(lfc_of_tested_ratio, feature_names,
                                   test_result['lfc_column_positive'])
@@ -1879,11 +1905,7 @@ def get_rna_kinetics_model_results(gene_data: GeneData,
                                   tested_intron_index),
             test_result['lfc']))
         test_result['loss_full_model'] = results_full.final_loss
-        test_result['loss_reduced_model'] = results_reduced.final_loss
-        test_result['chi2_test_statistics'] = 2 * (results_reduced.final_loss
-                                                   - results_full.final_loss)
-        test_result['p_value_lrt'] = stats.chi2.sf(test_result['chi2_test_statistics'],
-                                                    df=test_result['lrt_df'])
+        test_result.update(get_lrt_results(results_full, results_reduced, test_result['lrt_df']))
         test_result['num_full_model_restarts'] = fits.num_full_model_restarts
         test_results_list.append(test_result)
 
@@ -2107,7 +2129,6 @@ def get_intron_coverage_model_results(
         lrt_row = lrt_input.lrt_metadata_row
         results_reduced = fits.results_reduced[lrt_index]
 
-        chi2_stat = 2 * (results_reduced.final_loss - results_full.final_loss)
         test_result = lrt_row.to_dict()
         test_result['rate_ratio'] = LFCParameter.ELONG_OVER_SPLICE
         test_result['intron_name'] = lfc_intron_name
@@ -2126,12 +2147,7 @@ def get_intron_coverage_model_results(
                                       lrt_row['lfc_column_negative']),
                 test_result['lfc']))
         test_result['loss_full_model'] = results_full.final_loss
-        test_result['loss_reduced_model'] = results_reduced.final_loss
-        test_result['chi2_test_statistics'] = chi2_stat
-        test_result['p_value_lrt'] = stats.chi2.sf(chi2_stat, df=lrt_row['lrt_df'])
-        test_result['training_diverged_reduced_model'] = results_reduced.training_diverged
-        test_result['training_converged_reduced_model'] = results_reduced.converged
-        test_result['num_epochs_reduced_model'] = results_reduced.num_epochs
+        test_result.update(get_lrt_results(results_full, results_reduced, lrt_row['lrt_df']))
         test_result['num_full_model_restarts'] = fits.num_full_model_restarts
         test_results_list.append(test_result)
 
@@ -2245,11 +2261,15 @@ def get_global_rna_kinetics_model_results(
         global_gene_data: GlobalGeneData,
         dataset_metadata: DatasetMetadata,
         plug_in_coverage_fits: Optional[list[PlugInCoverageFit]] = None,
+        run_lrt: bool = True,
         device: str = 'cpu',
         verbose: bool = False,
 ) -> ModelFitResults:
     """
     Fit the genome-wide model and run every likelihood ratio test it supports.
+
+    With `run_lrt` False no reduced model is fitted, and the test results keep one row per test
+    with the likelihood ratio test columns null.
 
     Given `plug_in_coverage_fits`, lfc_elong_over_splice and the pi intercepts come from the
     coverage fits covering this dataset's introns rather than from here. The LFC is shared across
@@ -2340,7 +2360,7 @@ def get_global_rna_kinetics_model_results(
     fits = fit_full_and_reduced_models(fit_full_from_scratch=fit_full_from_scratch,
                                        fit_reduced=fit_reduced,
                                        refit_full_from_reduced=refit_full_from_reduced,
-                                       num_reduced_models=len(lrt_inputs))
+                                       num_reduced_models=len(lrt_inputs) if run_lrt else 0)
     model, training_results = fits.model_full, fits.results_full
 
     # Derived from the full fit, so after the restart loop: a restart replaces the full model.
@@ -2354,10 +2374,9 @@ def get_global_rna_kinetics_model_results(
     test_results_list: list[dict] = []
     for lrt_index, lrt_input in enumerate(lrt_inputs):
         lrt_row, lrt_specification = lrt_input.lrt_metadata_row, lrt_input.lrt_specification
-        results_reduced = fits.results_reduced[lrt_index]
+        results_reduced = fits.results_reduced[lrt_index] if run_lrt else None
         lfc_of_tested_ratio = get_lfc_of_tested_ratio(full_state, lrt_specification.tested_ratio)
 
-        chi2_stat = 2 * (results_reduced.final_loss - training_results.final_loss)
         test_result = lrt_row.to_dict()
         test_result['rate_ratio'] = lrt_specification.tested_ratio
         test_result['lfc'] = (
@@ -2366,12 +2385,7 @@ def get_global_rna_kinetics_model_results(
                 - get_lfc_of_column(lfc_of_tested_ratio, feature_names,
                                     lrt_row['lfc_column_negative']))
         test_result['loss_full_model'] = training_results.final_loss
-        test_result['loss_reduced_model'] = results_reduced.final_loss
-        test_result['chi2_test_statistics'] = chi2_stat
-        test_result['p_value_lrt'] = stats.chi2.sf(chi2_stat, df=lrt_row['lrt_df'])
-        test_result['training_diverged_reduced_model'] = results_reduced.training_diverged
-        test_result['training_converged_reduced_model'] = results_reduced.converged
-        test_result['num_epochs_reduced_model'] = results_reduced.num_epochs
+        test_result.update(get_lrt_results(training_results, results_reduced, lrt_row['lrt_df']))
         test_result['num_full_model_restarts'] = fits.num_full_model_restarts
         test_results_list.append(test_result)
 
