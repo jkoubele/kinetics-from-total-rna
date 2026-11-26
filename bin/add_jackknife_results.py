@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from rna_kinetics.estimation import add_jackknife_results
+from rna_kinetics.inference import add_jackknife_results
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

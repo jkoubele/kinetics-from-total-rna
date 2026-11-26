@@ -9,9 +9,9 @@ import torch
 from tqdm import tqdm
 
 from rna_kinetics.data import MODEL_DTYPE, load_dataset_metadata
-from rna_kinetics.estimation import (get_intron_coverage_model_results,
-                                     concat_plug_in_coverage_fits, get_jackknife_design_status,
-                                     get_jackknife_ratio_lfc_df, JackknifeStatus)
+from rna_kinetics.inference import (concat_plug_in_coverage_fits, get_jackknife_design_status,
+                                    get_jackknife_ratio_lfc_df, JackknifeStatus)
+from rna_kinetics.estimation import get_intron_coverage_model_results
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -99,7 +99,8 @@ if __name__ == "__main__":
                                                          dataset_metadata.feature_names)
 
     if args.jackknife_drop_sample is not None:
-        get_jackknife_ratio_lfc_df(results, args.jackknife_drop_sample).to_csv(
+        get_jackknife_ratio_lfc_df(
+            results.ratio_lfcs, results.model_parameters, args.jackknife_drop_sample).to_csv(
             args.output_folder / f'jackknife_ratio_lfcs_{args.jackknife_drop_sample}.tsv',
             sep='\t', index=False)
         # Frozen by the RNA kinetics replicate leaving out the same sample, so that the

@@ -1,7 +1,7 @@
 import itertools
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Optional, NamedTuple
+from typing import Optional, NamedTuple, OrderedDict
 
 import numpy as np
 import pandas as pd
@@ -99,6 +99,100 @@ PLUG_IN_TESTABLE_RATIOS = tuple(tested_ratio for tested_ratio in TestedRatio
                                 if tested_ratio != TestedRatio.ELONG_OVER_SPLICE)
 GLOBAL_PLUG_IN_TESTABLE_RATIOS = tuple(tested_ratio for tested_ratio in GLOBAL_MODEL_TESTED_RATIOS
                                        if tested_ratio in PLUG_IN_TESTABLE_RATIOS)
+
+
+StateDict = OrderedDict[str, torch.Tensor]
+
+
+def _get_lfc_without_intron_axis(lfc: torch.Tensor, intron_index: int) -> torch.Tensor:
+    """One LFC parameter as a (num_features,) vector, dropping the intron axis where it has one."""
+    return lfc if lfc.dim() == 1 else lfc[:, intron_index]
+
+
+def get_lfc_of_lfc_combination(state_dict: StateDict,
+                               lfc_combination: LFCCombination,
+                               intron_index: int = 0) -> torch.Tensor:
+    """
+    The fitted LFC of one rate ratio, as a (num_features,) vector.
+
+    The ratio arrives already decomposed into (parameter, coefficient) pairs, which is what lets
+    the intron coverage model use this as well: its single LFC is a ratio in its own right and has
+    no entry in `RATIO_AS_LFC_COMBINATION`.
+
+    The elongation and splicing LFCs may carry an intron axis, in which case the given intron's
+    column is taken; initiation never does.
+    """
+    terms = [coefficient * _get_lfc_without_intron_axis(state_dict[attribute], intron_index)
+             for attribute, coefficient in lfc_combination]
+    return torch.stack(terms).sum(dim=0)
+
+
+def get_lfc_of_tested_ratio(state_dict: StateDict,
+                            tested_ratio: TestedRatio,
+                            intron_index: int = 0) -> torch.Tensor:
+    """
+    The fitted LFC of the rate ratio under test, as a (num_features,) vector.
+
+    Three of the six ratios are single parameters; the other three combine two or three of them,
+    which is well defined because the parametrized three span all six.
+
+    Used both to hot start the reduced model and to report the tested ratio's effect size, neither
+    of which can read a single parameter for the three unparametrized ratios.
+    """
+    return get_lfc_of_lfc_combination(state_dict, RATIO_AS_LFC_COMBINATION[tested_ratio],
+                                      intron_index)
+
+
+def get_lfc_of_column(lfc_of_tested_ratio: torch.Tensor,
+                      feature_names: list[str],
+                      column_name) -> float:
+    """
+    One design column's share of the tested ratio's LFC, for assembling a reported effect size.
+
+    A contrast is a difference between two design columns, named by `lfc_column_positive` and
+    `lfc_column_negative` in the LRT metadata. Either can be absent, in which case
+    `create_design_matrices.R` writes an empty string, which arrives here as NaN once the TSV has
+    been through pandas, and the column contributes zero. That happens in two situations:
+
+    - a categorical contrast against the factor's reference level, which has no column of its own
+      because the intercept absorbs it
+    - a continuous covariate, which has no second group at all
+
+    So `lfc = get_lfc_of_column(positive) - get_lfc_of_column(negative)` gives the LFC relative to
+    the reference in the first case, and the covariate's own LFC in the second.
+    """
+    if pd.isna(column_name):
+        return 0.0
+    return lfc_of_tested_ratio[feature_names.index(column_name)].item()
+
+
+# The ratios the prior is defined over, in the order `estimate_prior_variance.R` writes its
+# covariance columns. The other three ratios are linear combinations of these, so penalising these
+# three jointly penalises all six; doing it with one covariance rather than six separate weights is
+# what keeps the implied prior a distribution at all.
+#
+# These are the three the models parametrize, and the basis has to be handed its covariances
+# rather than reconstruct them. From variances alone a pair's covariance can only be recovered as
+# `cov(a, b) = (var(a) + var(b) - var(a - b)) / 2`, which needs `a - b` to be one of the six
+# ratios as well, and two ratios combine into a third only when they share a rate. init/deg and
+# elong/splice share none, so `get_ratio_lfc_df` publishes `cov_with_*` instead; see
+# `get_contrast_covariance`.
+#
+# `get_prior_penalty` still writes each basis ratio in terms of the parameters through
+# `RATIO_AS_LFC_COMBINATION`, which is now the identity here. It is kept general so that the basis
+# remains a wire format, fixed by the column names of `regularization_coefficients.tsv`, that can
+# move without the parametrization following it.
+LFC_PRIOR_BASIS = (TestedRatio.INIT_OVER_DEG,
+                   TestedRatio.ELONG_OVER_SPLICE,
+                   TestedRatio.SPLICE_OVER_DEG)
+
+# The model attributes the basis ratios are built from. `IntronCoverageModel` holds only
+# `lfc_elong_over_splice`, so it has no joint covariance to publish and
+# `estimate_prior_variance.R` fits its prior one ratio at a time. Which of the two applies is read
+# off the model rather than its class, matching how the R side dispatches on what its input holds.
+LFC_PRIOR_BASIS_PARAMETERS = frozenset(
+    attribute for basis_ratio in LFC_PRIOR_BASIS
+    for attribute, _ in RATIO_AS_LFC_COMBINATION[basis_ratio])
 
 
 class CoverageFitStatus(StrEnum):
