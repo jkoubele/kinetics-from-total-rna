@@ -7,8 +7,9 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from rna_kinetics.estimation import (get_regularized_intron_coverage_model_results,
-                                     PlugInCoverageFit, concat_plug_in_coverage_fits)
+from rna_kinetics.models import PlugInCoverageFit
+from rna_kinetics.inference import concat_plug_in_coverage_fits
+from rna_kinetics.estimation import get_regularized_intron_coverage_model_results
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

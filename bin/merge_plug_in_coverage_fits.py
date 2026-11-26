@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from rna_kinetics.estimation import merge_plug_in_coverage_fits
+from rna_kinetics.inference import merge_plug_in_coverage_fits
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

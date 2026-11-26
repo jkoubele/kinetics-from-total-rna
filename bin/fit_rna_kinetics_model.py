@@ -8,7 +8,8 @@ import torch
 from tqdm import tqdm
 
 from rna_kinetics.data import CountDistribution, load_dataset_metadata, load_gene_data_list
-from rna_kinetics.estimation import get_rna_kinetics_model_results, CacheForRegularization, StateDict
+from rna_kinetics.models import StateDict
+from rna_kinetics.estimation import get_rna_kinetics_model_results, CacheForRegularization
 
 
 def parse_bool_in_argparse(argument: str) -> bool:

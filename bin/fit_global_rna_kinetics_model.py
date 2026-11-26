@@ -7,9 +7,9 @@ import torch
 
 from rna_kinetics.data import (CountDistribution, load_dataset_metadata, load_gene_data_list,
                                concat_gene_data_list)
-from rna_kinetics.estimation import (get_global_rna_kinetics_model_results,
-                                     get_jackknife_design_status, get_jackknife_ratio_lfc_df,
-                                     JackknifeStatus)
+from rna_kinetics.inference import (get_jackknife_design_status, get_jackknife_ratio_lfc_df,
+                                    JackknifeStatus)
+from rna_kinetics.estimation import get_global_rna_kinetics_model_results
 
 
 def parse_bool_in_argparse(argument: str) -> bool:
@@ -121,7 +121,8 @@ if __name__ == "__main__":
     )
 
     if args.jackknife_drop_sample is not None:
-        get_jackknife_ratio_lfc_df(results, args.jackknife_drop_sample).to_csv(
+        get_jackknife_ratio_lfc_df(
+            results.ratio_lfcs, results.model_parameters, args.jackknife_drop_sample).to_csv(
             args.output_folder / f'jackknife_ratio_lfcs_{args.jackknife_drop_sample}.tsv',
             sep='\t', index=False)
         raise SystemExit(0)
